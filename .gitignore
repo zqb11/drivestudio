@@ -13,6 +13,11 @@ data/argoverse
 data/nuscenes
 data/kitti
 data/nuplan
+data/deepaccident
+work_dirs/
+package/
+SegFormer/
+third_party/
 vscode_debugs
 debug/
 .vscode

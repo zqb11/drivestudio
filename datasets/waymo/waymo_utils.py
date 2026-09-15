@@ -28,9 +28,9 @@ def project_vehicle_to_image(vehicle_pose, calibration, points):
     """
     # Transform points from vehicle to world coordinate system (can be
     # vectorized).
-    pose_matrix = np.array(vehicle_pose.transform).reshape(4, 4)
+    pose_matrix = np.array(vehicle_pose.transform).reshape(4, 4)# 自车在世界坐标系的位姿矩阵，将点坐标从车辆坐标系转换到世界坐标系
     world_points = np.zeros_like(points)
-    for i, point in enumerate(points):
+    for i, point in enumerate(points):# 遍历8点，将坐标从车辆坐标系转换到世界坐标系
         cx, cy, cz, _ = np.matmul(pose_matrix, [*point, 1])
         world_points[i] = (cx, cy, cz)
 
@@ -38,8 +38,8 @@ def project_vehicle_to_image(vehicle_pose, calibration, points):
     # zeroes.
     extrinsic = tf.reshape(
         tf.constant(list(calibration.extrinsic.transform), dtype=tf.float32), [4, 4]
-    )
-    intrinsic = tf.constant(list(calibration.intrinsic), dtype=tf.float32)
+    )# 提取相机外参矩阵
+    intrinsic = tf.constant(list(calibration.intrinsic), dtype=tf.float32)# 提取相机内参矩阵
     metadata = tf.constant(
         [
             calibration.width,
@@ -47,10 +47,10 @@ def project_vehicle_to_image(vehicle_pose, calibration, points):
             dataset_pb2.CameraCalibration.GLOBAL_SHUTTER,
         ],
         dtype=tf.int32,
-    )
-    camera_image_metadata = list(vehicle_pose.transform) + [0.0] * 10
+    )# 提取相机图像的宽高和快门类型，构成metadata
+    camera_image_metadata = list(vehicle_pose.transform) + [0.0] * 10# 构成camera_image_metadata，包含自车在世界坐标系的位姿和一些占位符（速度和延迟统计信息）
 
-    # Perform projection and return projected image coordinates (u, v, ok).
+    # Perform projection and return projected image coordinates (u, v, ok). 将3D点从世界坐标系投影到图像平面上，得到像素坐标(u, v)和ok标志
     return py_camera_model_ops.world_to_image(
         extrinsic, intrinsic, metadata, camera_image_metadata, world_points
     ).numpy()

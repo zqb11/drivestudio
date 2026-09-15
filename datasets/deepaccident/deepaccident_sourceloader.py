@@ -9,6 +9,7 @@ from omegaconf import OmegaConf
 
 import torch
 from torch import Tensor
+import pickle
 
 from pytorch3d.transforms import matrix_to_quaternion
 from datasets.base.scene_dataset import ModelType
@@ -17,30 +18,34 @@ from datasets.base.pixel_source import ScenePixelSource, CameraData
 
 logger = logging.getLogger()
 
-# define each class's node type
+# define each class's node type 实例类与节点类的映射关系：节点类是整型枚举变量(0-刚性 1-SMPL 2-可形变)
 OBJECT_CLASS_NODE_MAPPING = {
-    "Vehicle": ModelType.RigidNodes,
-    "Pedestrian": ModelType.SMPLNodes,
-    "Cyclist": ModelType.DeformableNodes
+    "car": ModelType.RigidNodes,
+    "van": ModelType.RigidNodes,
+    "truck": ModelType.RigidNodes,
+    "pedestrian": ModelType.SMPLNodes,
+    "cyclist": ModelType.DeformableNodes,
+    "motorcycle": ModelType.DeformableNodes
 }
-SMPLNODE_CLASSES = ["Pedestrian"]
+SMPLNODE_CLASSES = ["pedestrian"]
 
 # OpenCV to Dataset coordinate transformation
 # opencv coordinate system: x right, y down, z front
-# waymo coordinate system: x front, y left, z up
+# deepaccident coordinate system: x front, y right, z up
 OPENCV2DATASET = np.array(
-    [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]]
+    [[0, 0, 1, 0], [1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]]
 )
 
-# Waymo Camera List:
-# 0: front_camera
-# 1: front_left_camera
-# 2: front_right_camera
-# 3: left_camera
-# 4: right_camera
-AVAILABLE_CAM_LIST = [0, 1, 2, 3, 4]
+# DeepAccident Camera List:
+#0: CAM_FRONT         
+#1: CAM_FRONT_LEFT    
+#2: CAM_FRONT_RIGHT  
+#3: CAM_BACK         
+#4: CAM_BACK_LEFT     
+#5: CAM_BACK_RIGHT   
+AVAILABLE_CAM_LIST = [0, 1, 2, 3, 4, 5]
 
-class WaymoCameraData(CameraData):
+class DeepAccidentCameraData(CameraData):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         
@@ -56,29 +61,26 @@ class WaymoCameraData(CameraData):
         intrinsic = np.loadtxt(
             os.path.join(self.data_path, "intrinsics", f"{self.cam_id}.txt")
         )
-        fx, fy, cx, cy = intrinsic[0], intrinsic[1], intrinsic[2], intrinsic[3]
-        k1, k2, p1, p2, k3 = intrinsic[4], intrinsic[5], intrinsic[6], intrinsic[7], intrinsic[8]
+        fx, fy, cx, cy = intrinsic[0][1], intrinsic[1][2], intrinsic[0][0], intrinsic[1][0]
         # scale intrinsics w.r.t. load size 根据load size相对于原始图像尺寸的缩放比例调整内参中的焦距和主点坐标
         fx, fy = (
-            fx * self.load_size[1] / self.original_size[1],
+            fx * self.load_size[1] / self.original_size[1], 
             fy * self.load_size[0] / self.original_size[0],
         )
         cx, cy = (
             cx * self.load_size[1] / self.original_size[1],
             cy * self.load_size[0] / self.original_size[0],
         )
-        _intrinsics = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-        _distortions = np.array([k1, k2, p1, p2, k3])# 畸变参数：k1k2k3-径向畸变参数，p1p2-切向畸变参数
-
+        _intrinsics = np.array([[fx, 0, cx], [0, -fy, cy], [0, 0, 1]])
         # load camera extrinsics
         cam_to_ego = np.loadtxt(
             os.path.join(self.data_path, "extrinsics", f"{self.cam_id}.txt")
         )
         # because we use opencv coordinate system to generate camera rays,
         # we need a transformation matrix to covnert rays from opencv coordinate
-        # system to waymo coordinate system.
+        # system to deepaccident coordinate system.
         # opencv coordinate system: x right, y down, z front
-        # waymo coordinate system: x front, y left, z up
+        # deepaccident coordinate system: x front, y right, z up
         cam_to_ego = cam_to_ego @ OPENCV2DATASET
 
         # compute per-image poses and intrinsics
@@ -102,10 +104,11 @@ class WaymoCameraData(CameraData):
             cam2world = ego_to_world @ cam_to_ego
             cam_to_worlds.append(cam2world)
             intrinsics.append(_intrinsics)
-            distortions.append(_distortions)
+            #distortions.append(_distortions)
 
         self.intrinsics = torch.from_numpy(np.stack(intrinsics, axis=0)).float()# 当前视角所有时间帧内参
-        self.distortions = torch.from_numpy(np.stack(distortions, axis=0)).float()# 当前视角所有时间帧畸变参数
+        self.distortions = None
+        #torch.from_numpy(np.stack(distortions, axis=0)).float()# 当前视角所有时间帧畸变参数
         self.cam_to_worlds = torch.from_numpy(np.stack(cam_to_worlds, axis=0)).float()# 当前视角所有时间帧相机坐标系->新世界坐标系(首帧车辆坐标系)的变换矩阵
     # 获取指定视角所有时间帧的cam到新world变换矩阵
     @classmethod 
@@ -138,7 +141,7 @@ class WaymoCameraData(CameraData):
 
         return torch.from_numpy(np.stack(cam_to_worlds, axis=0)).float()
 
-class WaymoPixelSource(ScenePixelSource):
+class DeepAccidentPixelSource(ScenePixelSource):
     def __init__(
         self,
         dataset_name: str,
@@ -160,7 +163,7 @@ class WaymoPixelSource(ScenePixelSource):
         # 遍历所有视角
         for idx, cam_id in enumerate(self.camera_list):
             logger.info(f"Loading camera {cam_id}")
-            camera = WaymoCameraData(
+            camera = DeepAccidentCameraData(
                 dataset_name=self.dataset_name,
                 data_path=self.data_path,
                 cam_id=cam_id,
@@ -235,7 +238,7 @@ class WaymoPixelSource(ScenePixelSource):
         # shape (num_frames, num_instances)
         per_frame_instance_mask = np.zeros((num_full_frames, num_instances))# 每一帧所包含的有效实例标记
         for frame_idx, valid_instances in frame_instances.items():# 遍历每一帧所包含的实例
-            per_frame_instance_mask[int(frame_idx), valid_instances] = 1# 标记每一帧所包含的有效实例，有该实例为1，无该实例为0
+            per_frame_instance_mask[int(frame_idx), valid_instances] = 1# 标记每一帧所包含的实例，有该实例为1，无该实例为0
         
         # select the frames that are in the range of start_timestep and end_timestep
         instances_pose = torch.from_numpy(instances_pose[self.start_timestep:self.end_timestep]).float()
@@ -258,28 +261,28 @@ class WaymoPixelSource(ScenePixelSource):
         # (num_instances, 3) 对每个实例在所有时间帧的尺寸取平均，得到每个实例的尺寸
         self.instances_size = instances_size.sum(0) / per_frame_instance_mask.sum(0).unsqueeze(-1)
         # (num_frames, num_instances)
-        self.per_frame_instance_mask = per_frame_instance_mask# 所有时间帧所包含的有效实例标记
+        self.per_frame_instance_mask = per_frame_instance_mask# 所有时间帧所包含的有无(根据label文件)实例掩码，该时间帧有该实例为1，没有为0
         # (num_instances)
         self.instances_true_id = instances_true_id# 实例id
         # (num_instances)
-        self.instances_model_types = instances_model_types# 实例类别对应的节点类型索引
+        self.instances_model_types = instances_model_types# 实例类别对应的节点类型索引：0-
         
         if self.data_cfg.load_smpl:
             # Collect camera-to-world matrices for all available cameras
             cam_to_worlds = {}
             for cam_id in AVAILABLE_CAM_LIST:
-                cam_to_worlds[cam_id] = WaymoCameraData.get_camera2worlds(
+                cam_to_worlds[cam_id] = DeepAccidentCameraData.get_camera2worlds(
                     self.data_path, 
                     str(cam_id), 
                     self.start_timestep, 
                     self.end_timestep
                 )# 所有视角所有时间帧的cam到新世界坐标系的变换矩阵
 
-            # load SMPL parameters 加载行人smpl参数
+            # load SMPL parameters 从人类轨迹加载人类smpl字典
             smpl_dict = joblib.load(os.path.join(self.data_path, "humanpose", "smpl.pkl"))
             frame_num = self.end_timestep - self.start_timestep
             
-            smpl_human_all = {}# smpl行人字典：key是行人id，value是一个字典，表示当前行人在当前时间帧的参数，包含smpl姿态(全局姿态和局部姿态)、位置(在新世界坐标系的位置)和体型参数 以及 在当前时间帧是否可见且SMPL参数是否有效
+            smpl_human_all = {}# smpl行人字典：key是行人id，value是一个字典，表示当前行人在每个时间帧的参数，包含姿态(全局姿态和局部姿态)、位置(在新世界坐标系的位置)和体型参数 以及 至少一个视角有2D框且有匹配的SMPL模型参数
             for fi in tqdm(range(self.start_timestep, self.end_timestep), desc="Loading SMPL"):# 遍历时间帧
                 for instance_id, ins_smpl in smpl_dict.items():# 遍历行人id和smpl参数
                     if instance_id not in smpl_human_all:
@@ -290,13 +293,13 @@ class WaymoPixelSource(ScenePixelSource):
                             "frame_valid": torch.zeros((frame_num), dtype=torch.bool)
                         }# 初始化smpl行人字典参数为0
                         smpl_human_all[instance_id]["smpl_quats"][:, :, 0] = 1.0# 将旋转四元数初始化为[1, 0, 0, 0]，表示没有旋转
-                    if ins_smpl["valid_mask"][fi]:# 如果当前时间帧的valid_mask为True，表示该行人在当前时间帧可见且SMPL参数有效
+                    if ins_smpl["valid_mask"][fi]:# 如果当前时间帧的valid_mask为True，表示该行人在当前时间帧至少一个视角有2D框且有匹配的SMPL模型参数
                         betas = ins_smpl["smpl"]["betas"][fi]
                         smpl_human_all[instance_id]["smpl_betas"][fi - self.start_timestep] = betas# 当前行人在当前时间帧的体型参数
                         
                         body_pose = ins_smpl["smpl"]["body_pose"][fi]# 当前时间帧当前行人的自身局部姿态，由23个骨骼关节的旋转矩阵表示
                         smpl_orient = ins_smpl["smpl"]["global_orient"][fi]# 当前时间帧当前行人在相机坐标系的姿态
-                        cam_depend = ins_smpl["selected_cam_idx"][fi].item()# 当前时间帧当前行人参数是在哪个相机视角估计出的
+                        cam_depend = ins_smpl["selected_cam_idx"][fi].item()# 当前时间帧当前行人smpl模型参数是在哪个相机视角估计出的
                         
                         c2w = cam_to_worlds[cam_depend][fi - self.start_timestep]
                         world_orient = c2w[:3, :3].to(smpl_orient.device) @ smpl_orient.squeeze()# 当前时间帧当前行人在新世界坐标系的姿态
@@ -315,11 +318,11 @@ class WaymoPixelSource(ScenePixelSource):
                         
                         smpl_human_all[instance_id]["smpl_quats"][fi - self.start_timestep] = smpl_quats# 当前行人在当前时间帧的全局姿态和局部姿态四元数
                         smpl_human_all[instance_id]["smpl_trans"][fi - self.start_timestep] = o2w[:3, 3]# 当前行人在当前时间帧的位于新世界坐标系的位置
-                        smpl_human_all[instance_id]["frame_valid"][fi - self.start_timestep] = True# 当前行人在当前时间帧可见且SMPL参数有效
+                        smpl_human_all[instance_id]["frame_valid"][fi - self.start_timestep] = True# 当前行人在当前时间帧至少一个视角有2D框且有匹配的SMPL模型参数
 
             self.smpl_human_all = smpl_human_all
             
-class WaymoLiDARSource(SceneLidarSource):
+class DeepAccidentLiDARSource(SceneLidarSource):
     def __init__(
         self,
         lidar_data_config: OmegaConf,
@@ -352,35 +355,32 @@ class WaymoLiDARSource(SceneLidarSource):
         Load the calibration files of the dataset.
         e.g., lidar to world transformation matrices.
         """
-        # Note that in the Waymo Open Dataset, the lidar coordinate system is the same
-        # as the vehicle coordinate system waymo数据集的lidar坐标系与自车坐标系相同
+        # Note that in the DeepAccident Dataset, the lidar coordinate system is different
+        # from the vehicle coordinate system deepaccident数据集的lidar坐标系与自车坐标系不同
         lidar_to_worlds = []# 所有时间帧的lidar坐标系->新世界坐标系(首帧车辆坐标系)的变换矩阵
-
         # we tranform the poses w.r.t. the first timestep to make the origin of the
         # first ego pose as the origin of the world coordinate system.
         ego_to_world_start = np.loadtxt(
             os.path.join(self.data_path, "ego_pose", f"{self.start_timestep:03d}.txt")
         )
         for t in range(self.start_timestep, self.end_timestep):
+            # load lidar_to_ego transformation matrix 
+            lidar_to_ego = np.loadtxt(
+                os.path.join(self.data_path, "lidar_to_ego", f"{t:03d}.txt")
+            )
             ego_to_world_current = np.loadtxt(
                 os.path.join(self.data_path, "ego_pose", f"{t:03d}.txt")
             )
             # compute ego_to_world transformation
-            lidar_to_world = np.linalg.inv(ego_to_world_start) @ ego_to_world_current
+            lidar_to_world = np.linalg.inv(ego_to_world_start) @ ego_to_world_current @ lidar_to_ego
             lidar_to_worlds.append(lidar_to_world)
 
         self.lidar_to_worlds = torch.from_numpy(
             np.stack(lidar_to_worlds, axis=0)
         ).float()# 加载所有时间帧的lidar坐标系->新世界坐标系(首帧车辆坐标系)的变换矩阵
-    # 加载所有时间帧截断范围之内的点云的起点、单位方向向量、距离、激光雷达ID、全局可见性掩码、激光点云颜色、场景流(位移)、场景流类别、真值标签、归一化时间戳
+    # 加载所有时间帧新世界坐标系的激光起点、点云单位方向、点云距离、点云可见性掩码、点云颜色、点云归一化时间戳
     def load_lidar(self):
-        """
-        Load the lidar data of the dataset from the filelist.
-        """
-        origins, directions, ranges, laser_ids = [], [], [], []
-        # flow/ground info are used for evaluation only
-        flows, flow_classes, grounds = [], [], []
-        # in waymo, we simplify timestamps as the time indices
+        origins, directions, ranges = [], [], []
         timesteps = []
 
         accumulated_num_original_rays = 0
@@ -388,74 +388,30 @@ class WaymoLiDARSource(SceneLidarSource):
         for t in trange(
             0, len(self.lidar_filepaths), desc="Loading lidar", dynamic_ncols=True
         ):# 遍历所有时间帧的lidar数据
-            # each lidar_info contains an Nx14 array
-            # from left to right:
-            # origins(激光起点): 3d, points(激光打到的空间点): 3d, flows(场景流，以速度表示，单位：m/s): 3d, flow_class(场景流类别): 1d,
-            # ground_labels(真值标签): 1d, intensities(反射强度): 1d, elongations(脉冲展宽): 1d, laser_ids(激光雷达ID): 1d
-            lidar_info = np.memmap(
-                self.lidar_filepaths[t],
-                dtype=np.float32,
-                mode="r",
-            ).reshape(-1, 14)
+            lidar_info = np.fromfile(self.lidar_filepaths[t], dtype=np.float32).reshape(-1, 4)
             original_length = len(lidar_info)# 该时间帧原始激光线数/激光点云总数
             accumulated_num_original_rays += original_length# 所有时间帧原始激光点云总数
 
-            # select lidar points based on the laser id
-            if self.data_cfg.only_use_top_lidar:# 是否仅使用车顶激光雷达
-                # laser_ids: 0: TOP, 1: FRONT, 2: SIDE_LEFT, 3: SIDE_RIGHT, 4: REAR
-                lidar_info = lidar_info[lidar_info[:, 13] == 0]# 只保留车顶激光雷达的点云
+            lidar_points = torch.from_numpy(lidar_info[:, :3]).float()# 前三个值是该时间帧点云在激光雷达坐标系的坐标
+            lidar_origins = torch.zeros_like(lidar_points)# 该时间帧激光起点与点云坐标形状一样，设为全0
 
-            lidar_origins = torch.from_numpy(lidar_info[:, :3]).float()# 激光起点
-            lidar_points = torch.from_numpy(lidar_info[:, 3:6]).float()# 激光打到的空间点
-            lidar_ids = torch.from_numpy(lidar_info[:, 13]).float()# 激光雷达ID
-            lidar_flows = torch.from_numpy(lidar_info[:, 6:9]).float()# 场景流
-            lidar_flow_classes = torch.from_numpy(lidar_info[:, 9]).long()# 场景流类别
-            ground_labels = torch.from_numpy(lidar_info[:, 10]).long()# 真值标签
-            # we don't collect intensities and elongations for now
-
-            # select lidar points based on a truncated ego-forward-directional range基于自车坐标系的前向范围选择激光点云，这样做是为了保证大部分激光点云在相机的范围内
-            # this is to make sure most of the lidar points are within the range of the camera
-            valid_mask = torch.ones_like(lidar_origins[:, 0]).bool()# 初始化一个全为True的掩码，表示所有点云都有效
-            if self.data_cfg.truncated_max_range is not None:# 过滤远处点云
-                valid_mask = lidar_points[:, 0] < self.data_cfg.truncated_max_range# 将雷达坐标系x/前方距离小于截断最大距离范围的点云标记为True，其他点云标记为False
-            if self.data_cfg.truncated_min_range is not None:# 过滤近处点云(处于盲区内的噪点)
-                valid_mask = valid_mask & (
-                    lidar_points[:, 0] > self.data_cfg.truncated_min_range
-                )# 将雷达坐标系x/前方距离超过截断最小距离范围的点云标记为True，其他点云标记为False，最终得到前方距离在截断最小距离和截断最大距离范围内的点云掩码
-            # 保留截断范围之内的点云
-            lidar_origins = lidar_origins[valid_mask]
-            lidar_points = lidar_points[valid_mask]
-            lidar_ids = lidar_ids[valid_mask]
-            lidar_flows = lidar_flows[valid_mask]
-            lidar_flow_classes = lidar_flow_classes[valid_mask]
-            ground_labels = ground_labels[valid_mask]
-            # transform lidar points from lidar coordinate system to world coordinate system
             lidar_origins = (
                 self.lidar_to_worlds[t][:3, :3] @ lidar_origins.T
                 + self.lidar_to_worlds[t][:3, 3:4]
-            ).T
+            ).T# 新世界坐标系的该时间帧激光起点
             lidar_points = (
                 self.lidar_to_worlds[t][:3, :3] @ lidar_points.T
                 + self.lidar_to_worlds[t][:3, 3:4]
-            ).T
-            # scene flows are in the lidar coordinate system, so we need to rotate them
-            lidar_flows = (self.lidar_to_worlds[t][:3, :3] @ lidar_flows.T).T
-            # compute lidar directions 激光线方向=激光打到的空间点-激光起点，激光线距离=激光起点与空间点欧式距离，并归一化得到单位方向向量
-            lidar_directions = lidar_points - lidar_origins
-            lidar_ranges = torch.norm(lidar_directions, dim=-1, keepdim=True)
-            lidar_directions = lidar_directions / lidar_ranges
-            # we use time indices as the timestamp for waymo dataset
-            lidar_timestamp = torch.ones_like(lidar_ranges).squeeze(-1) * t
-            accumulated_num_rays += len(lidar_ranges)# 所有时间帧截断范围之内的点云总数
-            # 所有时间帧截断范围之内的点云的起点、单位方向向量、距离、激光雷达ID、场景流、场景流类别、真值标签、时间戳
+            ).T# 新世界坐标系的该时间帧点云坐标
+            lidar_directions = lidar_points - lidar_origins# 该时间帧点云方向
+            lidar_ranges = torch.norm(lidar_directions, dim=-1, keepdim=True)# 该时间帧点云距离
+            lidar_directions = lidar_directions / lidar_ranges# 该时间帧点云方向的单位向量
+            lidar_timestamp = torch.ones_like(lidar_ranges).squeeze(-1) * t# 该时间帧点云时间戳
+            accumulated_num_rays += len(lidar_ranges)# 所有时间帧激光点云总数
+
             origins.append(lidar_origins)
             directions.append(lidar_directions)
             ranges.append(lidar_ranges)
-            laser_ids.append(lidar_ids)
-            flows.append(lidar_flows)
-            flow_classes.append(lidar_flow_classes)
-            grounds.append(ground_labels)
-            # we use time indices as the timestamp for waymo dataset
             timesteps.append(lidar_timestamp)
 
         logger.info(
@@ -463,34 +419,16 @@ class WaymoLiDARSource(SceneLidarSource):
             f"({accumulated_num_rays / accumulated_num_original_rays * 100:.2f}% of "
             f"{accumulated_num_original_rays} original rays)"
         )
-        logger.info("Filter condition:")
-        logger.info(f"  only_use_top_lidar: {self.data_cfg.only_use_top_lidar}")
-        logger.info(f"  truncated_max_range: {self.data_cfg.truncated_max_range}")
-        logger.info(f"  truncated_min_range: {self.data_cfg.truncated_min_range}")
-        # 加载所有时间帧截断范围之内的点云的起点、单位方向向量、距离、激光雷达ID、全局可见性掩码、激光点云颜色、场景流(位移)、场景流类别、真值标签、归一化时间戳
+        # 加载所有时间帧的激光起点、点云单位方向、点云距离、点云可见性掩码、点云颜色、点云归一化时间戳
         self.origins = torch.cat(origins, dim=0)
         self.directions = torch.cat(directions, dim=0)
         self.ranges = torch.cat(ranges, dim=0)
-        self.laser_ids = torch.cat(laser_ids, dim=0)
         self.visible_masks = torch.zeros_like(self.ranges).squeeze().bool()# 全局可见性掩码，初始化为False，后续投影过程中记录哪些激光点云能投影到相机视野中
         self.colors = torch.ones_like(self.directions)# 激光点云颜色，初始化为白色(1, 1, 1)，用于兼容某些需要 RGB 颜色输入的神经渲染管线
-        # becasue the flows here are velocities (m/s), and the fps of the lidar is 10(每两帧之间的时间间隔是0.1s),
-        # we need to divide the velocities by 10 to get the displacements/flows
-        # between two consecutive lidar scans
-        self.flows = torch.cat(flows, dim=0) / 10.0# 相邻两帧的点云位移s=vt
-        self.flow_classes = torch.cat(flow_classes, dim=0)
-        self.grounds = torch.cat(grounds, dim=0).bool()
 
-        # the underscore here is important.
         self._timesteps = torch.cat(timesteps, dim=0)
-        self.register_normalized_timestamps()# 归一化时间戳
-
-    def to(self, device: torch.device):
-        super().to(device)
-        self.flows = self.flows.to(device)
-        self.flow_classes = self.flow_classes.to(device)
-        self.grounds = self.grounds.to(self.device)
-
+        self.register_normalized_timestamps()
+    # 获取指定时间帧新世界坐标系的激光点云，包括激光起点、点云单位方向、点云距离、点云归一化时间戳和当前帧点云掩码
     def get_lidar_rays(self, time_idx: int) -> Dict[str, Tensor]:
         """
         Get the of rays for rendering at the given timestep.
@@ -503,14 +441,12 @@ class WaymoLiDARSource(SceneLidarSource):
         directions = self.directions[self.timesteps == time_idx]
         ranges = self.ranges[self.timesteps == time_idx]
         normalized_time = self.normalized_time[self.timesteps == time_idx]
-        flows = self.flows[self.timesteps == time_idx]
         return {
             "lidar_origins": origins,
             "lidar_viewdirs": directions,
             "lidar_ranges": ranges,
             "lidar_normed_time": normalized_time,
             "lidar_mask": self.timesteps == time_idx,
-            "lidar_flows": flows,
         }
     # 清除所有时间帧的无效点云
     def delete_invisible_pts(self) -> None:
@@ -522,7 +458,6 @@ class WaymoLiDARSource(SceneLidarSource):
             self.origins = self.origins[self.visible_masks]
             self.directions = self.directions[self.visible_masks]
             self.ranges = self.ranges[self.visible_masks]
-            self.flows = self.flows[self.visible_masks]
             self._timesteps = self._timesteps[self.visible_masks]
             self._normalized_time = self._normalized_time[self.visible_masks]
             self.colors = self.colors[self.visible_masks]

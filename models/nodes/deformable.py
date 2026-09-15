@@ -9,20 +9,20 @@ from models.gaussians.basics import *
 from models.nodes.rigid import RigidNodes
 
 logger = logging.getLogger()
-
+# 形变节点高斯，继承普通高斯，初始化实例嵌入和形变网络
 class DeformableNodes(RigidNodes):
     def __init__(
         self,
         **kwargs
     ):
-        super().__init__(**kwargs)
-        self.instances_embedding = torch.zeros(1, self.networks_cfg.embed_dim, device=self.device)
+        super().__init__(**kwargs)# 继承普通高斯模型
+        self.instances_embedding = torch.zeros(1, self.networks_cfg.embed_dim, device=self.device)# 实例嵌入：(1, embed_dim)全0
         self.deform_network = ConditionalDeformNetwork(
             input_ch=3, **self.networks_cfg
-        ).to(self.device)
-
+        ).to(self.device)# 形变网络
+    # 从可形变节点的动态实例字典初始化可形变实例高斯参数
     def create_from_pcd(self, instance_pts_dict: Dict[str, torch.Tensor]) -> None:
-        super().create_from_pcd(instance_pts_dict=instance_pts_dict)
+        super().create_from_pcd(instance_pts_dict=instance_pts_dict)# 继承刚性实例高斯初始化函数
         init_embedding = torch.rand(self.num_instances, self.networks_cfg.embed_dim, device=self.device)
         self.instances_embedding = Parameter(init_embedding) # overrided the previous one
         
@@ -85,9 +85,9 @@ class DeformableNodes(RigidNodes):
         else:
             rgbs = torch.sigmoid(colors[:, 0, :])
         
-        valid_mask = self.get_pts_valid_mask()
+        valid_mask = self.get_pts_valid_mask()# 当前时间帧下可形变节点所有点云是否有效
             
-        activated_opacities = self.get_opacity * valid_mask.float().unsqueeze(-1)
+        activated_opacities = self.get_opacity * valid_mask.float().unsqueeze(-1)# 无效点不透明度设为0，使其在光栅化时完全透明，不会对渲染结果产生影响
         activated_rotations = self.quat_act(world_quats)
         actovated_colors = rgbs
         

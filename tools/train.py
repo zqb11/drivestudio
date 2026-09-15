@@ -72,7 +72,7 @@ def setup(args):
         ):
             continue
         wandb.run.name = args.run_name
-        wandb.run.save()
+        wandb.run.save(args.config_file, policy="now")
         wandb.config.update(OmegaConf.to_container(cfg, resolve=True))
         wandb.config.update(args)
 
@@ -110,15 +110,15 @@ def main(args):
     # build dataset
     dataset = DrivingDataset(data_cfg=cfg.data)
 
-    # setup trainer
+    # setup trainer从固定数值初始化高斯场景图、超参、场景规模、损失、指标等
     trainer = import_str(cfg.trainer.type)(
-        **cfg.trainer,
+        **cfg.trainer,# 配置文件的训练器超参
         num_timesteps=dataset.num_img_timesteps,
-        model_config=cfg.model,
+        model_config=cfg.model,# 配置文件的模型超参
         num_train_images=len(dataset.train_image_set),
         num_full_images=len(dataset.full_image_set),
         test_set_indices=dataset.test_timesteps,
-        scene_aabb=dataset.get_aabb().reshape(2, 3),
+        scene_aabb=dataset.get_aabb().reshape(2, 3),# 场景边界框(第一行最小点，第二行最大点)
         device=device
     )
     
@@ -133,14 +133,14 @@ def main(args):
             f"Resuming training from {args.resume_from}, starting at step {trainer.step}"
         )
     else:
-        trainer.init_gaussians_from_dataset(dataset=dataset)
+        trainer.init_gaussians_from_dataset(dataset=dataset)# 从加载的预处理数据初始化高斯
         logger.info(
             f"Training from scratch, initializing gaussians from dataset, starting at step {trainer.step}"
         )
     
     if args.enable_viewer:
-        # a simple viewer for background visualization
-        trainer.init_viewer(port=args.viewer_port)
+        # a simple viewer for visualization 训练过程可视化3D视频
+        trainer.init_viewer(port=args.viewer_port)# 训练过程创建viser服务器和客户端
     
     # define render keys
     render_keys = [
@@ -170,9 +170,9 @@ def main(args):
     trainer.initialize_optimizer()
     
     # setup metric logger
-    metrics_file = os.path.join(cfg.log_dir, "metrics.json")
+    metrics_file = os.path.join(cfg.log_dir, "metrics.json")# 指标文件
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
-    all_iters = np.arange(trainer.step, trainer.num_iters + 1)
+    all_iters = np.arange(trainer.step, trainer.num_iters + 1)# 迭代步数数组
     
     # DEBUG USE
     # do_evaluation(
@@ -184,10 +184,10 @@ def main(args):
     #     args=args,
     # )
 
-    for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):
+    for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):# 遍历迭代步数
         #----------------------------------------------------------------------------
-        #----------------------------     Validate     ------------------------------
-        if step % cfg.logging.vis_freq == 0 and cfg.logging.vis_freq > 0:
+        #----------------------------     Validate(每隔一定迭代步数可视化训练状态)     ------------------------------
+        if step % cfg.logging.vis_freq == 0 and cfg.logging.vis_freq > 0:# 每隔vis_freq可视化训练状态
             logger.info("Visualizing...")
             vis_timestep = np.linspace(
                 0,
@@ -195,7 +195,7 @@ def main(args):
                 trainer.num_iters // cfg.logging.vis_freq + 1,
                 endpoint=False,
                 dtype=int,
-            )[step // cfg.logging.vis_freq]
+            )[step // cfg.logging.vis_freq]# 可视化时间步
             with torch.no_grad():
                 render_results = render_images(
                     trainer=trainer,
@@ -205,9 +205,9 @@ def main(args):
                     vis_indices=[
                         vis_timestep * dataset.pixel_source.num_cams + i
                         for i in range(dataset.pixel_source.num_cams)
-                    ],
-                )
-            if args.enable_wandb:
+                    ],# 可视化图像帧索引，是同一个时间步的多视角
+                )# 当前训练状态的渲染指标及其打印
+            if args.enable_wandb:# 训练过程某一帧指标上传wandb云端
                 wandb.log(
                     {
                         "image_metrics/psnr": render_results["psnr"],
@@ -228,8 +228,8 @@ def main(args):
                 num_cams=dataset.pixel_source.num_cams,
                 fps=cfg.render.fps,
                 verbose=False,
-            )
-            if args.enable_wandb:
+            )# 返回和保存当前训练状态对应时间步的渲染图片，包括目标rgb、预测rgb、背景rgb、动态rgb、刚性节点rgb、可形变节点rgb和smpl节点rgb
+            if args.enable_wandb:# 训练过程某一帧渲染图片上传wandb云端
                 for k, v in vis_frame_dict.items():
                     wandb.log({"image_rendering/" + k: wandb.Image(v)})
             del render_results
@@ -240,12 +240,12 @@ def main(args):
         #----------------------------  training step  -------------------------------
         # prepare for training
         trainer.set_train()
-        trainer.preprocess_per_train_step(step=step)
+        trainer.preprocess_per_train_step(step=step)# 获取高斯类的迭代步数
         trainer.optimizer_zero_grad() # zero grad
         
         # get data
-        train_step_camera_downscale = trainer._get_downscale_factor()
-        image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)
+        train_step_camera_downscale = trainer._get_downscale_factor()# 训练和测试评估阶段的图像降采样倍数
+        image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)# 根据随机选取的训练图像帧索引得到对应的下采样目标图像信息(包括采样光线)和相机信息，之后再重置下采样因子
         for k, v in image_infos.items():
             if isinstance(v, torch.Tensor):
                 image_infos[k] = v.cuda(non_blocking=True)
@@ -254,23 +254,23 @@ def main(args):
                 cam_infos[k] = v.cuda(non_blocking=True)
         
         # forward & backward
-        outputs = trainer(image_infos, cam_infos)
-        trainer.update_visibility_filter()
+        outputs = trainer(image_infos, cam_infos)# 模型基于当前图像帧的图像和相机信息前向预测高斯rgb图、高斯深度图、高斯不透明度、天空rgb图、经过高斯不透明度过滤的天空rgb图、经过外观仿射变换的完整rgb图
+        trainer.update_visibility_filter()# 更新高斯类别的2D溅射块半径，是后续点云密化、修剪或调整学习率的几何依据
 
         loss_dict = trainer.compute_losses(
             outputs=outputs,
             image_infos=image_infos,
             cam_infos=cam_infos,
-        )
+        )# 计算损失
         # check nan or inf
         for k, v in loss_dict.items():
             if torch.isnan(v).any():
                 raise ValueError(f"NaN detected in loss {k} at step {step}")
             if torch.isinf(v).any():
                 raise ValueError(f"Inf detected in loss {k} at step {step}")
-        trainer.backward(loss_dict)
+        trainer.backward(loss_dict)# 损失反向传播
         
-        # after training step
+        # after training step 每个训练步的后处理
         trainer.postprocess_per_train_step(step=step)
         
         #----------------------------------------------------------------------------
@@ -285,7 +285,7 @@ def main(args):
         metric_logger.update(**{"train_stats/gaussian_num_" + k: v for k, v in trainer.get_gaussian_count().items()})
         metric_logger.update(**{"losses/"+k: v.item() for k, v in loss_dict.items()})
         metric_logger.update(**{"train_stats/lr_" + group['name']: group['lr'] for group in trainer.optimizer.param_groups})
-        if args.enable_wandb:
+        if args.enable_wandb:# 日志上传wandb云端
             wandb.log({k: v.avg for k, v in metric_logger.meters.items()})
 
         #----------------------------------------------------------------------------
@@ -342,32 +342,33 @@ def main(args):
         dataset=dataset,
         render_keys=render_keys,
         args=args,
-    )
+    )# 可选：基于测试轨迹和完整轨迹渲染视频、评估指标；基于新轨迹渲染视频
     
     if args.enable_viewer:
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
     
     return step
-
+# 从0训练或续训，同时进行训练过程背景节点可视化
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Train Gaussian Splatting for a single scene")
     parser.add_argument("--config_file", help="path to config file", type=str)
     parser.add_argument("--output_root", default="./work_dirs/", help="path to save checkpoints and logs", type=str)
     
     # eval
-    parser.add_argument("--resume_from", default=None, help="path to checkpoint to resume from", type=str)
+    parser.add_argument("--resume_from", default="work_dirs/omnire/deepaccident_mini_0_6cams_20260907/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
+    #parser.add_argument("--resume_from", default=None, help="path to checkpoint to resume from", type=str)
     parser.add_argument("--render_video_postfix", type=str, default=None, help="an optional postfix for video")    
     
-    # wandb logging part
+    # wandb logging part: 实验可视化与追踪工具
     parser.add_argument("--enable_wandb", action="store_true", help="enable wandb logging")
-    parser.add_argument("--entity", default="ziyc", type=str, help="wandb entity name")
-    parser.add_argument("--project", default="drivestudio", type=str, help="wandb project name, also used to enhance log_dir")
-    parser.add_argument("--run_name", default="omnire", type=str, help="wandb run name, also used to enhance log_dir")
-    
+    parser.add_argument("--entity", default="qiangbzhang-university-of-science-and-technology-of-china", type=str, help="wandb entity name")
+    parser.add_argument("--project", default="omnire", type=str, help="wandb project name, also used to enhance log_dir")
+    parser.add_argument("--run_name", default="deepaccident_mini_0_6cams_20260907", type=str, help="wandb run name, also used to enhance log_dir")
+    #parser.add_argument("--run_name", default="waymo_31_5cams_20260715", type=str, help="wandb run name, also used to enhance log_dir")
     # viewer
     parser.add_argument("--enable_viewer", action="store_true", help="enable viewer")
-    parser.add_argument("--viewer_port", type=int, default=8080, help="viewer port")
+    parser.add_argument("--viewer_port", type=int, default=1024, help="viewer port")
     
     # misc
     parser.add_argument("opts", help="Modify config options using the command-line", default=None, nargs=argparse.REMAINDER)

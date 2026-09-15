@@ -1,5 +1,9 @@
 import argparse
 import numpy as np
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 if __name__ == "__main__":
     """
@@ -13,6 +17,7 @@ if __name__ == "__main__":
     - KITTI
     - NUPlan
     - PandaSet
+    - DeepAccident
 
     Usage:
     ------
@@ -27,7 +32,7 @@ if __name__ == "__main__":
         --start_idx <start_idx> \
         --num_scenes <num_scenes> \
         --process_keys <process_keys>
-    
+
     Example:
     --------
     Waymo:
@@ -38,7 +43,7 @@ if __name__ == "__main__":
         --process_keys images lidar calib pose dynamic_masks objects \
         --workers 8 \
         --scene_ids 23 114 327 621 703 172 552 788
-    
+
     PandaSet:
     python datasets/preprocess.py \
         --data_root data/pandaset/raw \
@@ -47,7 +52,16 @@ if __name__ == "__main__":
         --target_dir data/pandaset/processed \
         --workers 32 \
         --process_keys images lidar calib pose dynamic_masks objects
-    
+
+    DeepAccident:
+    python datasets/preprocess.py \
+        --data_root /path/to/deepaccident/raw/mini/type1_subtype1_accident \
+        --dataset deepaccident \
+        --target_dir data/deepaccident/processed/mini \
+        --workers 4 \
+        --num_scenes 7 \
+        --process_keys images calib lidar pose objects
+
     Please refer to the documentation for more information on the available options.
 
     Arguments:
@@ -244,8 +258,20 @@ if __name__ == "__main__":
             process_id_list=scene_ids_list,
             workers=args.workers,
         )
+    elif args.dataset == "deepaccident":
+        from datasets.deepaccident.deepaccident_preprocess import DeepAccidentProcessor
+        
+        scene_ids_list = [int(scene_id) for scene_id in scene_ids_list]
+        dataset_processor = DeepAccidentProcessor(
+            load_dir=args.data_root,
+            save_dir=args.target_dir,
+            prefix=args.split,
+            process_keys=args.process_keys,
+            process_id_list=scene_ids_list,
+            workers=args.workers,
+        )# 检索所有场景名，为所有场景建立输入数据目录
     else:
-        raise ValueError(f"Unknown dataset {args.dataset}, please choose from waymo, pandaset, argoverse, nuscenes, kitti, nuplan")
+        raise ValueError(f"Unknown dataset {args.dataset}, please choose from waymo, pandaset, argoverse, nuscenes, kitti, nuplan, deepaccident")
 
     if args.scene_ids is not None and args.workers == 1:
         for scene_id in args.scene_ids:

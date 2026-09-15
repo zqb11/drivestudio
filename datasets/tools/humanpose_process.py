@@ -26,20 +26,20 @@ def extract_humanpose(
         verbose: bool, whether to visualize debug images
         fps: int, FPS for the visualization video
     """
-    # project human boxes to 2D image space
+    # project human boxes to 2D image space 基于标注和投影得到所有视角行人的2D框轨迹
     GTTracks_meta = projection_fn(
         scene_dir, camera_list=camera_list,
         save_temp=save_temp, verbose=verbose,
         narrow_width_ratio=0.2, fps=fps
     )
     
-    # run 4DHuman to get predicted human tracks with SMPL parameters
+    # run 4DHuman to get predicted human tracks with SMPL parameters 利用目标检测、人体重建、深度追踪模型得到所有视角行人的3Dsmpl模型轨迹
     PredTracks_meta = run_4DHumans(
         scene_dir, camera_list=camera_list,
         save_temp=save_temp, verbose=verbose, fps=fps
     )
     
-    # match the predicted tracks with the ground truth tracks
+    # match the predicted tracks with the ground truth tracks# 匹配行人的2D框轨迹和3Dsmpl模型轨迹，后处理匹配的轨迹，包括插值缺失smpl参数的帧、合并不同视角的匹配轨迹，插值缺失2D框的帧，最终得到行人轨迹
     smpl_meta = match_and_postprocess(
         scene_dir, camera_list=camera_list,
         GTTracksDict=GTTracks_meta, PredTracksDict=PredTracks_meta,
@@ -107,6 +107,8 @@ if __name__ == "__main__":
         from datasets.kitti.kitti_human_utils import project_human_boxes, CAMERA_LIST
     elif args.dataset == "nuplan":
         from datasets.nuplan.nuplan_human_utils import project_human_boxes, CAMERA_LIST
+    elif args.dataset == "deepaccident":
+        from datasets.deepaccident.deepaccident_human_utils import project_human_boxes, CAMERA_LIST
     else:
         raise ValueError(f"Unknown dataset {args.dataset}, please choose from waymo, pandaset, argoverse, nuscenes, kitti, nuplan")
     

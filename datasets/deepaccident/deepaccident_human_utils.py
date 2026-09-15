@@ -10,7 +10,7 @@ from utils.geometry import (
     get_corners,
     project_camera_points_to_image
 )
-from .waymo_sourceloader import (
+from .deepaccident_sourceloader import (
     SMPLNODE_CLASSES,
     OPENCV2DATASET,
     AVAILABLE_CAM_LIST,
@@ -52,9 +52,10 @@ def project_human_boxes(
     intrinsics_dir = f'{scene_dir}/intrinsics'
     instances_dir = f'{scene_dir}/instances'
     valid_paths = [images_dir, poses_dir, extrinsics_dir, intrinsics_dir, instances_dir]
+    expand_width_ratio = 0.2
     for path in valid_paths:
         assert os.path.exists(path), \
-            f"Path {path} does not exist, you need to run waymo preprocess to generate the necessary files"
+            f"Path {path} does not exist, you need to run deepaccident preprocess to generate the necessary files"
     
     # create directories for saving the results
     save_dir = f'{scene_dir}/humanpose/temp/Pedes_GTTracks'
@@ -63,10 +64,10 @@ def project_human_boxes(
     
     if verbose:
         # create directories for saving the intermediate visualization results
-        video_dir = f'{scene_dir}/humanpose/temp/Pedes_GTTracks/vis'
+        video_dir = f'{scene_dir}/humanpose/temp/Pedes_GTTracks/vis'# 逐个视角的行人gt追踪视频
         if not os.path.exists(video_dir):
             os.makedirs(video_dir)
-        per_human_img_dir = f'{scene_dir}/humanpose/temp/Pedes_GTTracks/vis/images'
+        per_human_img_dir = f'{scene_dir}/humanpose/temp/Pedes_GTTracks/vis/images'# 逐个视角的行人gt追踪图像
         if not os.path.exists(per_human_img_dir):
             os.makedirs(per_human_img_dir)
     
@@ -80,7 +81,7 @@ def project_human_boxes(
     
     collector_all = {}
     # iterate over each camera
-    for cam_id in camera_list:
+    for cam_id in camera_list:# 遍历相机视角
         # check if already processed
         pkl_path = os.path.join(save_dir, f"{cam_id}.pkl")
         if os.path.exists(pkl_path):
@@ -100,24 +101,24 @@ def project_human_boxes(
             
             # define empty instance collector for each frame
             frame_collector = {
-                "gt_bbox": [],
+                "gt_bbox": [],# 行人框[x_min, y_min, x_max - x_min, y_max - y_min]
                 "extra_data": {
-                    "gt_track_id": [],
-                    "gt_class": [],
+                    "gt_track_id": [],# 行人id
+                    "gt_class": [],# 行人类别
                 }
             }
             
             # load extrinsic
             cam_to_ego = np.loadtxt(os.path.join(extrinsics_dir, f"{cam_id}.txt"))# 相机到自车
-            cam_to_ego = cam_to_ego @ OPENCV2DATASET# 转换矩阵从opencv坐标系到waymo坐标系
+            cam_to_ego = cam_to_ego @ OPENCV2DATASET# 采样光线从opencv坐标系到da坐标系
             ego_to_world = np.loadtxt(os.path.join(poses_dir, f"{str(frame_id).zfill(3)}.txt"))# 自车位姿
-            cam2world = ego_to_world @ cam_to_ego# 相机到世界坐标系的变换矩阵
+            cam_to_world = ego_to_world @ cam_to_ego# 相机到世界坐标系的变换矩阵
             
             # load intrinsic
+            #intrinsic = np.loadtxt(os.path.join(intrinsics_dir, f"{cam_id}.txt"))# 内参矩阵
             Ks = np.loadtxt(os.path.join(intrinsics_dir, f"{cam_id}.txt"))
-            fx, fy, cx, cy = Ks[0], Ks[1], Ks[2], Ks[3]
-            # k1, k2, p1, p2, k3 = Ks[4], Ks[5], Ks[6], Ks[7], Ks[8]
-            intrinsic = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)# 内参矩阵
+            fx, fy, cx, cy = Ks[0][1], Ks[1][2], Ks[0][0], Ks[1][0]
+            intrinsic = np.array([[fx, 0, cx], [0, -fy, cy], [0, 0, 1]], dtype=np.float32)# 内参矩阵
             
             # load image
             ori_image = cv2.imread(
@@ -135,27 +136,27 @@ def project_human_boxes(
                     
                     if ins["class_name"] not in SMPLNODE_CLASSES:# 如果不是行人，跳过
                         continue
-                    ins_anno = ins["frame_annotations"]# 该实例的时间帧信息
-                    index = ins_anno['frame_idx'].index(frame_id)# 该时间帧在该实例时间帧信息的下标
-                    obj_to_world = np.array(ins_anno['obj_to_world'][index])# 该时间帧该实例在世界坐标系的位姿
-                    l, w, h = ins_anno['box_size'][index]# 该时间帧该实例的长宽高
+                    ins_anno = ins["frame_annotations"]# 该实例信息
+                    index = ins_anno['frame_idx'].index(frame_id)# 该时间帧在该实例时间步列表的下标
+                    obj_to_world = np.array(ins_anno['obj_to_world'][index])# 该实例在该时间帧的世界坐标系的位姿
+                    l, w, h = ins_anno['box_size'][index]# 该实例在该时间帧的长宽高
                     
-                    # get box corners in object space 实例坐标系下实例顶点坐标
+                    # get box corners in object space 以几何中心为原点的实例坐标系下实例顶点坐标
                     corners = get_corners(l, w, h)
                     # transform box corners to world space 世界坐标系下实例顶点坐标
                     corners_world = obj_to_world[:3, :3] @ corners + obj_to_world[:3, 3:4]
                     # transform box corners to image space
-                    world2cam = np.linalg.inv(cam2world)
-                    corners_cam = world2cam[:3, :3] @ corners_world + world2cam[:3, 3:4]# 相机坐标系下实例顶点坐标
+                    world_to_cam = np.linalg.inv(cam_to_world)
+                    corners_cam = world_to_cam[:3, :3] @ corners_world + world_to_cam[:3, 3:4]# 相机坐标系下实例顶点坐标
                     cam_points, depth = project_camera_points_to_image(corners_cam.T, intrinsic)# 实例像素坐标和深度
                     
                     x_min, y_min = np.min(cam_points, axis=0)# 最小的x和y
                     x_max, y_max = np.max(cam_points, axis=0)# 最大的x和y
                     # clip left and right with this ratio
-                    if narrow_width_ratio > 0.:# 缩减2D投影框宽度
-                        length = x_max - x_min
-                        x_min += length * narrow_width_ratio# 最小x右移
-                        x_max -= length * narrow_width_ratio# 最大x左移
+                    # if expand_width_ratio > 0.:# 扩大2D投影框宽度
+                    #     length = x_max - x_min
+                    #     x_min -= length * expand_width_ratio# 最小x左移
+                    #     x_max += length * expand_width_ratio# 最大x右移
 
                     # clip the box to the image
                     original_area = (x_max - x_min) * (y_max - y_min)# 2D框初始面积
@@ -163,11 +164,11 @@ def project_human_boxes(
                     y_min, y_max = np.clip(y_min, 0, H), np.clip(y_max, 0, H)
                     new_area = (x_max - x_min) * (y_max - y_min)# 2D框在图像内部的面积
                     
-                    # filter out boxes that are too small or too large
+                    # filter out boxes that are too small or too large 看结果决定是否需要更改
                     behind = depth.max() < 0# 如果最大深度小于0，说明实例在相机后方
                     too_small = new_area < W * H * (0.03)**2# 面积是否过小
                     too_large = new_area > W * H / 1.1# 面积是否过大
-                    too_far = np.linalg.norm(obj_to_world[:3, 3] - cam2world[:3, 3]) > 40# 物体离相机的直线距离是否过远
+                    too_far = np.linalg.norm(obj_to_world[:3, 3] - cam_to_world[:3, 3]) > 40# 物体离相机的直线距离是否过远
                     clip_large = new_area / original_area < 1/3# 2D框被裁面积是否过大
                     if too_small or too_large or clip_large or behind or too_far:
                         continue
@@ -180,7 +181,7 @@ def project_human_boxes(
                     frame_collector["extra_data"]["gt_track_id"].append(instance_id)
                     frame_collector["extra_data"]["gt_class"].append([0])
                     
-                    if verbose:
+                    if verbose:# 图像帧画行人框，命名为: 时间帧_实例id
                         # visualize the projected boxes of ONE instance
                         raw_image = cv2.rectangle(
                             ori_image.copy(), (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 255, 0), 2
@@ -193,16 +194,16 @@ def project_human_boxes(
                             image, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 255, 0), 2
                         )
                 
-                if verbose:# 蒋该视角该帧的实例可视化图片加入frames
+                if verbose:# 将图像帧的实例可视化图片加入frames
                     frames.append(image_plotted)
             else:
                 # if no instance in this frame, just save the original image
                 if verbose:
                     frames.append(ori_image)
 
-            collector[frame_id] = frame_collector# 该视角该帧的实例信息，包括2D框和一些额外信息
+            collector[frame_id] = frame_collector# 该视角图像帧的实例信息：实例框、实例id、实例类别
         
-        if verbose:# 将该视角的所有时间帧的实例可视化图片做成视频
+        if verbose:# 将该视角所有图像帧的行人可视化图片做成视频
             height, width = frames[0].shape[:2]
             output_path = os.path.join(video_dir, f"cam_{cam_id}.mp4")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')

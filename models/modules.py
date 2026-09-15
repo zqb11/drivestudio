@@ -170,7 +170,7 @@ class SkyModel(nn.Module):
         return {
             self.class_prefix+"all": self.parameters(),
         }
-        
+# 表示天空的cubemap模块
 class EnvLight(torch.nn.Module):
 
     def __init__(
@@ -183,10 +183,10 @@ class EnvLight(torch.nn.Module):
         super().__init__()
         self.class_prefix = class_name + "#"
         self.device = device
-        self.to_opengl = torch.tensor([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=torch.float32, device="cuda")
+        self.to_opengl = torch.tensor([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=torch.float32, device="cuda")# 数据集相机坐标系到opengl坐标系(X轴朝右 Y轴朝上 Z轴朝外(指向屏幕外，面向观察者))的旋转矩阵
         self.base = torch.nn.Parameter(
             0.5 * torch.ones(6, resolution, resolution, 3, requires_grad=True),
-        )
+        )# 初始化cubemap：形状为(6, resolution, resolution, 3)，像素rgb都为0.5，所以是可优化的全灰立方体
         
     def forward(self, image_infos):
         l = image_infos["viewdirs"]
@@ -206,7 +206,7 @@ class EnvLight(torch.nn.Module):
         return {
             self.class_prefix+"all": self.parameters(),
         }
-        
+# 曝光仿射矫正模块
 class AffineTransform(nn.Module):
     def __init__(
         self,
@@ -221,18 +221,18 @@ class AffineTransform(nn.Module):
         self.class_prefix = class_name + "#"
         self.device = device
         self.embedding_dim = embedding_dim
-        self.pixel_affine = pixel_affine
-        self.embedding = nn.Embedding(n, embedding_dim, dtype=torch.float32)
+        self.pixel_affine = pixel_affine# 是否使用像素级仿射矫正
+        self.embedding = nn.Embedding(n, embedding_dim, dtype=torch.float32)# 每张图像的外观编码，表示独有的曝光、亮度、对比度等信息
         
         input_dim = (embedding_dim + 2)if self.pixel_affine else embedding_dim
         self.decoder = nn.Sequential(
             nn.Linear(input_dim, base_mlp_layer_width),
             nn.ReLU(),
             nn.Linear(base_mlp_layer_width, 12),
-        )
+        )# 解码器将外观编码映射为仿射变换矩阵的(A,b)
         self.in_test_set = False
         
-        self.zero_init()
+        self.zero_init()# 模型参数初始化为全0，表示初始时不对图像进行仿射变换
         
     def zero_init(self):
         torch.nn.init.zeros_(self.embedding.weight)
@@ -262,7 +262,7 @@ class AffineTransform(nn.Module):
         return {
             self.class_prefix+"all": self.parameters(),
         }
-        
+# 相机位姿微调模块
 class CameraOptModule(torch.nn.Module):
     """Camera pose optimization module."""
 
@@ -276,39 +276,39 @@ class CameraOptModule(torch.nn.Module):
         self.class_prefix = class_name + "#"
         self.device = device
         # Delta positions (3D) + Delta rotations (6D)
-        self.embeds = torch.nn.Embedding(n, 9)
+        self.embeds = torch.nn.Embedding(n, 9)# 每个相机的位姿微调参数，前3维是位置矫正增量，后6维是姿态矫正增量
         # Identity rotation in 6D representation
-        self.register_buffer("identity", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+        self.register_buffer("identity", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))# 6D表示的单位旋转矩阵
         
-        self.zero_init() # important for initialization !!
+        self.zero_init() # important for initialization !!将相机位姿微调层权重初始化为0，表示初始时不对相机位姿进行微调
 
     def zero_init(self):
         torch.nn.init.zeros_(self.embeds.weight)
 
     def random_init(self, std: float):
         torch.nn.init.normal_(self.embeds.weight, std=std)
-
+    # 根据相机位姿矫正参数，在相机坐标系下微调相机位姿
     def forward(self, camtoworlds: Tensor, embed_ids: Tensor) -> Tensor:
         """Adjust camera pose based on deltas.
 
         Args:
             camtoworlds: (..., 4, 4)
-            embed_ids: (...,)
+            embed_ids: (...,)图像帧id
 
         Returns:
             updated camtoworlds: (..., 4, 4)
         """
         assert camtoworlds.shape[:-2] == embed_ids.shape
-        batch_shape = camtoworlds.shape[:-2]
-        pose_deltas = self.embeds(embed_ids)  # (..., 9)
-        dx, drot = pose_deltas[..., :3], pose_deltas[..., 3:]
+        batch_shape = camtoworlds.shape[:-2]# 单帧或批量
+        pose_deltas = self.embeds(embed_ids)  # (..., 9)该图像帧对应的相机位姿矫正参数
+        dx, drot = pose_deltas[..., :3], pose_deltas[..., 3:]# 位置矫正增量，姿态矫正增量
         rot = rotation_6d_to_matrix(
             drot + self.identity.expand(*batch_shape, -1)
-        )  # (..., 3, 3)
-        transform = torch.eye(4, device=pose_deltas.device).repeat((*batch_shape, 1, 1))
-        transform[..., :3, :3] = rot
-        transform[..., :3, 3] = dx
-        return torch.matmul(camtoworlds, transform)
+        )  # (..., 3, 3)6d姿态增量转换为3*3姿态矫正矩阵
+        transform = torch.eye(4, device=pose_deltas.device).repeat((*batch_shape, 1, 1))# 4*4转换矫正矩阵
+        transform[..., :3, :3] = rot# 3*3位置是姿态矫正矩阵
+        transform[..., :3, 3] = dx# 3*1位置是位置矫正增量
+        return torch.matmul(camtoworlds, transform)# 原始相机位姿右乘变换矫正矩阵：在当前相机坐标系下矫正
 
     def get_param_groups(self):
         return {

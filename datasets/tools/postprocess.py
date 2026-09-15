@@ -99,7 +99,7 @@ def detect_breaks_mask(bool_sequence):
         mask[last_true_index + 1:len(bool_sequence)] = [False] * (len(bool_sequence) - last_true_index - 1)
 
     return mask
-    
+# 匹配行人的2D框轨迹和3Dsmpl模型轨迹，后处理匹配的轨迹，包括插值缺失smpl参数的帧、合并不同视角的匹配轨迹，插值缺失2D框的帧，最终得到行人轨迹
 def match_and_postprocess(
     scene_dir: str,
     GTTracksDict: Dict[int, Dict],
@@ -133,33 +133,33 @@ def match_and_postprocess(
             os.makedirs(temp_dir)
     
     # --------------------------------------------------------------------------
-    #                 Parse ground truth and predicted tracks
+    #                 Parse ground truth and predicted tracks(将原始轨迹数据转化为结构化格式)
     # --------------------------------------------------------------------------
     parsed_pred_track_all, parsed_gt_track_all = {}, {}
     for cam_id in camera_list:
         parsed_pred_track, parsed_gt_track = {}, {}
 
-        raw_pred_track = PredTracksDict[cam_id]
-        raw_gt_track = GTTracksDict[cam_id]
+        raw_pred_track = PredTracksDict[cam_id]# 该视角预测行人轨迹
+        raw_gt_track = GTTracksDict[cam_id]# 该视角目标行人轨迹
         assert len(raw_pred_track) == len(raw_gt_track), \
             f"len(raw_pred_track) {len(raw_pred_track)} != len(raw_gt_track) {len(raw_gt_track)}"
         num_f = len(raw_pred_track) # number of frames
         
-        for fi, pred_track_f in enumerate(raw_pred_track.values()):
+        for fi, pred_track_f in enumerate(raw_pred_track.values()):# 预测轨迹格式转换
             for i_, tid in enumerate(pred_track_f["tid"]):
                 if pred_track_f["tracked_time"][i_] != 0:
                     continue
                 if tid not in parsed_pred_track:
                     parsed_pred_track[tid] = {
-                        "valids": torch.zeros(num_f, dtype=torch.bool),
-                        "tracked_bbox": torch.zeros(num_f, 4),
+                        "valids": torch.zeros(num_f, dtype=torch.bool),# 有效帧的布尔掩码
+                        "tracked_bbox": torch.zeros(num_f, 4),# 每帧的预测行人边界框
                         "smpl": {
                             "global_orient": torch.zeros(num_f, 1, 3, 3),
                             "body_pose": torch.zeros(num_f, 23, 3, 3),
                             "betas": torch.zeros(num_f, 10),
-                        },
-                        "camera": torch.zeros(num_f, 3),
-                    }
+                        },# 每帧的SMPL参数，包括全局旋转、身体姿态和体型参数
+                        "camera": torch.zeros(num_f, 3),# 每帧的摄像机信息
+                    }# 每个预测轨迹
                 parsed_pred_track[tid]["valids"][fi] = True
                 parsed_pred_track[tid]["tracked_bbox"][fi] = torch.from_numpy(pred_track_f["bbox"][i_])
                 parsed_pred_track[tid]["smpl"]["global_orient"][fi] = torch.tensor(pred_track_f["smpl"][i_]["global_orient"])
@@ -168,13 +168,13 @@ def match_and_postprocess(
                 parsed_pred_track[tid]["camera"][fi] = torch.tensor(pred_track_f["camera"][i_])
         
         # collect GT track ids
-        for fi, gt_track_f in enumerate(raw_gt_track.values()):
+        for fi, gt_track_f in enumerate(raw_gt_track.values()):# 目标轨迹格式转换
             for i_, tid in enumerate(gt_track_f["extra_data"]["gt_track_id"]):
                 if tid not in parsed_gt_track:
                     parsed_gt_track[tid] = {
                         "valids": torch.zeros(num_f, dtype=torch.bool),
                         "tracked_bbox": torch.zeros(num_f, 4),
-                    }
+                    }# 每个目标轨迹
                 parsed_gt_track[tid]["valids"][fi] = True
                 parsed_gt_track[tid]["tracked_bbox"][fi] = torch.tensor(gt_track_f["gt_bbox"][i_])
         
@@ -182,21 +182,21 @@ def match_and_postprocess(
         parsed_gt_track_all[cam_id] = parsed_gt_track
     
     # --------------------------------------------------------------------------
-    #             Find GT tracks that have at least one 4D-Humans prediction
+    #             Find GT tracks that have at least one 4D-Humans prediction(对每个预测轨迹，通过IoU找到最佳匹配的GT轨迹，进而找到至少有一个预测轨迹匹配的GT轨迹)
     # --------------------------------------------------------------------------
     # For each camera:
     #   1. Compare predicted tracks to GT tracks using IoU (Intersection over Union)
     #   2. Link each predicted track to its best-matching GT track
     #
     # Key points:
-    # - Some GT tracks may not have predictions (e.g., far-away pedestrians)
-    # - A GT track might match multiple predicted tracks
-    # - We keep only GT tracks that have at least one prediction in any camera
+    # - Some GT tracks may not have predictions (e.g., far-away pedestrians): 某些行人无预测轨迹对应
+    # - A GT track might match multiple predicted tracks 
+    # - We keep only GT tracks that have at least one prediction in any camera: 保留至少一个预测轨迹匹配的GT轨迹
     #
     # Result: valid_gt_tids list contains GT tracks visible to 4D-Humans in at least one camera
     valid_gt_tids = []
     match_pred2gt = {}
-    for cam_id in camera_list: 
+    for cam_id in camera_list: # 遍历视角
         parsed_pred_track = parsed_pred_track_all[cam_id]
         parsed_gt_track = parsed_gt_track_all[cam_id]
         _matches = {}
@@ -214,27 +214,27 @@ def match_and_postprocess(
                     matched_gt_tid = gt_tid
             if matched_gt_tid == -1:
                 continue
-            _matches[pred_tid] = matched_gt_tid
+            _matches[pred_tid] = matched_gt_tid# 与pretid匹配的gtid
         
-        print(f"cam_id {cam_id}: {len(_matches)} pred tracks matched")
-        print("_matches:", _matches)
+        print(f"cam_id {cam_id}: {len(_matches)} pred tracks matched")# 该视角下与目标轨迹匹配的预测轨迹数量
+        print("_matches:", _matches)# 该视角下{预测轨迹id：目标轨迹id}
             
-        valid_gt_tids += list(_matches.values())
-        match_pred2gt[cam_id] = _matches
+        valid_gt_tids += list(_matches.values())# 每个视角有预测轨迹匹配的目标轨迹id
+        match_pred2gt[cam_id] = _matches# 每个视角的预测轨迹与目标轨迹的匹配关系
 
     # get unique valid GT IDs
-    valid_gt_tids = list(set(valid_gt_tids))
+    valid_gt_tids = list(set(valid_gt_tids))# 在所有视角至少有一个预测轨迹匹配的目标轨迹id列表
     print(f"valid_gt_tids: {valid_gt_tids}")
     
     # --------------------------------------------------------------------------
-    #                   Link GT tracks to predicted tracks
+    #                   Link GT tracks to predicted tracks(对每个目标轨迹，找到与之匹配的预测轨迹)
     # --------------------------------------------------------------------------
     # For each camera:
     #   1. Calculate average IoU between GT and predicted tracks
     #   2. Match each GT track to its best predicted track (if any)
     #
     # Key points:
-    # - A GT track can match different predicted tracks across cameras
+    # - A GT track can match different predicted tracks across cameras: 一个gt轨迹可以在不同视角下匹配不同的预测轨迹
     # - The same GT Track may have different predicted track IDs across cameras
     #   due to independent processing of each camera's video
     # - It connects the consistent GT ID to camera-specific predicted IDs
@@ -255,30 +255,30 @@ def match_and_postprocess(
                 for fi in range(num_f):
                     if parsed_pred_track[pred_tid]["valids"][fi] and parsed_gt_track[gt_tid]["valids"][fi]:
                         iou += compute_iou(parsed_pred_track[pred_tid]["tracked_bbox"][fi], parsed_gt_track[gt_tid]["tracked_bbox"][fi])
-                iou /= num_f
-                if iou > max_iou:
+                iou /= num_f# 计算该预测轨迹与目标轨迹的平均IoU
+                if iou > max_iou:# 当平均iou>最大iou，行人轨迹匹配的smpl模型轨迹id为当前轨迹id，否则为-1，表示行人轨迹无匹配的smpl模型轨迹
                     max_iou = iou
                     matched_pred_tid = pred_tid
-                _matches[gt_tid] = matched_pred_tid
+                _matches[gt_tid] = matched_pred_tid# 与gt_tid匹配的pred_tid
         
-        print(f"cam_id {cam_id}: {len(_matches)} GT tracks matched")
-        print("_matches:", _matches)
-        match_gt2pred[cam_id] = _matches
+        print(f"cam_id {cam_id}: {len(_matches)} GT tracks matched")# 该视角下与预测轨迹匹配的目标轨迹数量
+        print("_matches:", _matches)# 该视角下{目标轨迹id：预测轨迹id}
+        match_gt2pred[cam_id] = _matches# 每个视角的目标轨迹与预测轨迹的匹配关系
         
     # --------------------------------------------------------------------------
-    #           Collect SMPL parameters for each valid GT track
+    #           Collect SMPL parameters for each valid GT track(对每个目标轨迹，收集匹配的预测轨迹的SMPL参数)
     # --------------------------------------------------------------------------
     # This step processes the results of GT-to-pred track matching across multiple cameras:
-    # 1. For each valid GT track ID:
-    #    a. Initialize data structures to store SMPL parameters, camera info, and validity masks
-    #    b. For each camera:
-    #       - Record when the GT track appears in 2D (2DBox_appear_mask)
-    #       - If matched to a pred track:
-    #         * Collect SMPL parameters (global_orient, body_pose, betas) from the matched pred track
+    # 1. For each valid GT track ID:对于每个目标轨迹
+    #    a. Initialize data structures to store SMPL parameters, camera info, and validity masks(初始化数据结构，用于存储SMPL参数、摄像机信息和有效性掩码)
+    #    b. For each camera:对于每个视角
+    #       - Record when the GT track appears in 2D (2DBox_appear_mask)(记录目标框出现的帧)
+    #       - If matched to a pred track:如果目标轨迹匹配到预测轨迹
+    #         * Collect SMPL parameters (global_orient, body_pose, betas) from the matched pred track(从匹配的预测轨迹收集smpl参数)
     #         * Collect camera parameters
     #         * Mark frames where data is available (matched_mask)
     # 2. The collected data retains the multi-camera structure, allowing for later analysis
-    #    of track consistency across different views
+    #    of track consistency across different views(输出数据保留多视角结构，便于后续分析不同视角下的轨迹一致性)
     #
     # This approach allows us to:
     # - Maintain the GT track ID as the primary identifier
@@ -290,18 +290,18 @@ def match_and_postprocess(
     for gt_tid in valid_gt_tids:
         collector[gt_tid] = {
             "smpl": {
-                "global_orient": torch.zeros(num_c, num_f, 1, 3, 3),
-                "body_pose": torch.zeros(num_c, num_f, 23, 3, 3),
-                "betas": torch.zeros(num_c, num_f, 10),
-            },
-            "camera": torch.zeros(num_c, num_f, 3),
-            "2DBox_appear_mask": torch.zeros(num_c, num_f).bool(),
-            "area": torch.zeros(num_c, num_f),
-            "matched_mask": torch.zeros(num_c, num_f).bool(),
-        }
+                "global_orient": torch.zeros(num_c, num_f, 1, 3, 3),# 全局朝向
+                "body_pose": torch.zeros(num_c, num_f, 23, 3, 3),# 23个身体关节的姿态
+                "betas": torch.zeros(num_c, num_f, 10),# 体型参数
+            },# 人体模型参数
+            "camera": torch.zeros(num_c, num_f, 3),# 相机参数
+            "2DBox_appear_mask": torch.zeros(num_c, num_f).bool(),# 2D边界框出现掩码
+            "area": torch.zeros(num_c, num_f),# 2D边界框面积
+            "matched_mask": torch.zeros(num_c, num_f).bool(),# 匹配掩码
+        }# 每个目标轨迹字典
         
     # collect data
-    for cam_id in camera_list:
+    for cam_id in camera_list:# 利用每个视角匹配的预测轨迹smpl参数赋值每个视角目标轨迹smpl参数
         parsed_pred_track = parsed_pred_track_all[cam_id]
         parsed_gt_track = parsed_gt_track_all[cam_id]
         _matches = match_gt2pred[cam_id]
@@ -338,7 +338,7 @@ def match_and_postprocess(
         matched_mask = collector[gt_tid]["matched_mask"]
         # valid mask: 2DBox_appear_mask & matched_mask
         valid_mask = appear_mask & matched_mask
-        collector[gt_tid]["valid_mask"] = valid_mask
+        collector[gt_tid]["valid_mask"] = valid_mask# 匹配掩码与2DBox_appear_mask的交集，表示该帧是否有效
     
     # Save matched data in a format compatible with 4D-Humans visualization
     if save_temp:
@@ -367,20 +367,20 @@ def match_and_postprocess(
                         fi_info["camera"].append(collector[gt_tid]["camera"][cam_id, fi].numpy())
                 pkl_dict[fi] = fi_info
             joblib.dump(
-                pkl_dict, os.path.join(temp_dir, f"{cam_id}_matched.pkl")
+                pkl_dict, os.path.join(temp_dir, f"{cam_id}_matched.pkl")# 每个视角的匹配行人轨迹
             )
     
     # --------------------------------------------------------------------------
-    #           Complete data for all frames where GT 2D boxes exist
+    #           Complete data for all frames where GT 2D boxes exist(对每个目标轨迹，补全所有存在2D边界框但没有匹配的预测轨迹的帧的SMPL参数、摄像机信息)
     # --------------------------------------------------------------------------
     # For each camera and GT track:
     #   1. Check each frame where a GT 2D box exists (human is visible in scene)
     #   2. If no matched data exists for that frame:
-    #      - This often occurs due to occlusion or tracking failures
-    #      - We have the 2D box (know human's position) but lack SMPL params
-    #   3. Interpolate missing data (SMPL params, camera info) from surrounding frames
-    #   4. This ensures continuity in human pose data even when direct detection fails
-    #   5. Result: All frames with 2DBox_appear_mask==True will have complete data
+    #      - This often occurs due to occlusion or tracking failures(某一帧无预测轨迹的原因：遮挡或追踪失败)
+    #      - We have the 2D box (know human's position) but lack SMPL params(这一帧每个目标行人无smpl参数)
+    #   3. Interpolate missing data (SMPL params, camera info) from surrounding frames(从邻近帧插值smpl参数和摄像机信息)
+    #   4. This ensures continuity in human pose data even when direct detection fails(意义：即使追踪失败，也能保证人体姿态数据的连续性)
+    #   5. Result: All frames with 2DBox_appear_mask==True will have complete data(所有帧的每个目标行人都有完整的数据)
     # 
     # This step is crucial for handling temporary occlusions or detection misses,
     # maintaining a consistent track even when the pose predictor fails momentarily.
@@ -435,22 +435,22 @@ def match_and_postprocess(
                         fi_info["camera"].append(collector[gt_tid]["camera"][cam_id, fi].numpy())
                 pkl_dict[fi] = fi_info
             joblib.dump(
-                pkl_dict, os.path.join(temp_dir, f"{cam_id}_completed.pkl")
+                pkl_dict, os.path.join(temp_dir, f"{cam_id}_completed.pkl")# 每个视角的完整匹配行人轨迹
             )
     
     # --------------------------------------------------------------------------
-    #              Merge and refine SMPL data across all cameras
+    #              Merge and refine SMPL data across all cameras(合并不同视角的匹配轨迹，插值缺失3Dsmpl参数或2D框的帧)
     # --------------------------------------------------------------------------
     # 1. Initialize merged_collector:
-    #    - For each GT track, create a structure to hold combined data from all cameras
-    # 2. Merge data for each GT track:
-    #    a. Combine matched_mask from all cameras
-    #    b. Select best SMPL parameters for each frame:
-    #       - If only one camera detects the person, use that camera's data
-    #       - If multiple cameras detect (e.g., person moving across camera views):
-    #         * Choose the camera with largest detection area
+    #    - For each GT track, create a structure to hold combined data from all cameras(对于每个2D框轨迹，创建一个数据结构来保存所有视角的组合数据)
+    # 2. Merge data for each GT track: 合并不同视角的匹配轨迹
+    #    a. Combine matched_mask from all cameras(组合所有视角的匹配掩码)
+    #    b. Select best SMPL parameters for each frame:为当前2D框轨迹在每一帧选择最佳的SMPL参数
+    #       - If only one camera detects the person, use that camera's data(如果这一帧只有一个相机检测到该2D框，则使用该视角的3Dsmpl模型)
+    #       - If multiple cameras detect (e.g., person moving across camera views):如果这一帧有多视角检测到该2D框
+    #         * Choose the camera with largest detection area(选择2D框面积最大的视角，因为通常提供最准确的姿态估计)
     #         * This typically provides the most accurate pose estimation
-    #    c. Set must_appear_mask where the person is visible in any camera
+    #    c. Set must_appear_mask where the person is visible in any camera(如果该2D框在任一视角下可见，则设置must_appear_mask为true)
     #    d. Store selected SMPL parameters, camera info, and 2D box appearance masks
     merged_collector = {}
     for gt_tid in valid_gt_tids:
@@ -488,7 +488,7 @@ def match_and_postprocess(
         merged_collector[gt_tid]["selected_cam_idx"][mask] = masked_best_cam_id
 
     # 3. Fill gaps in SMPL data:
-    #    - For frames where must_appear_mask is true but matched_mask is false:
+    #    - For frames where must_appear_mask is true but matched_mask is false:对于全视角下2D框可见但没有匹配的3Dsmpl模型的时间帧，插值
     #      * Interpolate SMPL parameters (global_orient, body_pose, betas)
     #      * Interpolate camera info and selected camera index
     #    - This addresses frames where the person is visible but not detected
@@ -518,7 +518,7 @@ def match_and_postprocess(
             feature_full = interpolate_features(mask, feature_masked)
             merged_collector[gt_tid]["selected_cam_idx"][final_complete_mask] = feature_full.round()
         
-    # 4. Fill breaks in visibility:
+    # 4. Fill breaks in visibility:捕捉2D框在全视角中都不可见的短暂盲区（即全局视觉断层），并利用其消失前和重现后的 3D 姿态进行跨时序的插值预测
     #    - Detect short gaps in must_appear_mask sequence
     #    - For these gaps:
     #      * Set must_appear_mask to true
@@ -585,7 +585,7 @@ def match_and_postprocess(
                         fi_info["camera"].append(merged_collector[gt_tid]["camera"][cam_id, fi].numpy())
                 pkl_dict[fi] = fi_info
             joblib.dump(
-                pkl_dict, os.path.join(temp_dir, f"{cam_id}_merged.pkl")
+                pkl_dict, os.path.join(temp_dir, f"{cam_id}_merged.pkl")# 每个视角的合并匹配行人轨迹
             )
     
     # pop out 2DBox_appear_mask and selected_cam_idx and camera

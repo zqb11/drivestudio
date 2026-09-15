@@ -181,4 +181,36 @@ DATASETS_CONFIG = {
             "egocar_visible": False
         },
     },
+    "deepaccident": {
+        0: {
+            "camera_name": "CAM_FRONT",
+            "original_size": (900, 1600),
+            "egocar_visible": False
+        },
+        1: {
+            "camera_name": "CAM_FRONT_LEFT",
+            "original_size": (900, 1600),
+            "egocar_visible": False
+        },
+        2: {
+            "camera_name": "CAM_FRONT_RIGHT",
+            "original_size": (900, 1600),
+            "egocar_visible": False
+        },
+        3: {
+            "camera_name": "CAM_BACK",
+            "original_size": (900, 1600),
+            "egocar_visible": False
+        },
+        4: {
+            "camera_name": "CAM_BACK_LEFT",
+            "original_size": (900, 1600),
+            "egocar_visible": False
+        },
+        5: {
+            "camera_name": "CAM_BACK_RIGHT",
+            "original_size": (900, 1600),
+            "egocar_visible": False
+        },
+    },
 }

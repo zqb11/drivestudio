@@ -57,8 +57,8 @@ class SceneLidarSource(abc.ABC):
         raise NotImplementedError
 
     def load_data(self):
-        self.load_calibrations()
-        self.load_lidar()
+        self.load_calibrations()# 加载所有时间帧的lidar坐标系->新世界坐标系(首帧车辆坐标系)的变换矩阵
+        self.load_lidar()# 加载所有时间帧的激光起点、点云单位方向、点云距离、点云可见性掩码、点云颜色、点云归一化时间戳
         logger.info("[Lidar] All Lidar Data loaded.")
 
     def to(self, device: torch.device) -> "SceneLidarSource":
@@ -100,7 +100,7 @@ class SceneLidarSource(abc.ABC):
         Load the lidar data of the dataset from the filelist.
         """
         raise NotImplementedError
-
+    # 获得贴合场景的aabb最小点和最大点，即场景边界框
     def get_aabb(self) -> Tensor:
         """
         Returns:
@@ -117,17 +117,17 @@ class SceneLidarSource(abc.ABC):
         ), "Lidar points not loaded, cannot compute aabb."
         logger.info("[Lidar] Computing auto AABB based on downsampled lidar points....")
 
-        lidar_pts = self.origins + self.directions * self.ranges
+        lidar_pts = self.origins + self.directions * self.ranges# 所有时间帧的点云坐标
 
         # downsample the lidar points by uniformly sampling a subset of them
         lidar_pts = lidar_pts[
             torch.randperm(len(lidar_pts))[
                 : int(len(lidar_pts) / self.data_cfg.lidar_downsample_factor)
-            ]
-        ]
-        # compute the aabb by taking the given percentiles of the lidar coordinates in each dimension
-        aabb_min = torch.quantile(lidar_pts, self.data_cfg.lidar_percentile, dim=0)
-        aabb_max = torch.quantile(lidar_pts, 1 - self.data_cfg.lidar_percentile, dim=0)
+            ]# 选取部分点云索引并打乱
+        ]# # 选取部分点云坐标并打乱
+        # compute the aabb by taking the given percentiles of the lidar coordinates in each dimension贴合场景的aabb最小点和最大点
+        aabb_min = torch.quantile(lidar_pts, self.data_cfg.lidar_percentile, dim=0)# 取2%分位数，抛弃最外侧最极端的2%的超低点
+        aabb_max = torch.quantile(lidar_pts, 1 - self.data_cfg.lidar_percentile, dim=0)# 取98%分位数，抛弃最外侧最极端的2%的超高点
         del lidar_pts
         torch.cuda.empty_cache()
 

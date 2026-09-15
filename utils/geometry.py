@@ -49,9 +49,9 @@ def project_camera_points_to_image(points_cam, cam_intrinsics):
             - projected_points (np.ndarray): Shape (N, 2), projected 2D points in image space.
             - depths (np.ndarray): Shape (N,), depth values of the projected points.
     """
-    points_img = cam_intrinsics @ points_cam.T
-    depths = points_img[2, :]
-    projected_points = (points_img[:2, :] / (depths + 1e-6)).T
+    points_img = cam_intrinsics @ points_cam.T# 实例像素坐标xyz
+    depths = points_img[2, :]# 实例深度
+    projected_points = (points_img[:2, :] / (depths + 1e-6)).T# 实例像素坐标uv
     
     return projected_points, depths
 

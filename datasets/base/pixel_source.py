@@ -56,22 +56,22 @@ def get_rays(
     camera_dirs = torch.nn.functional.pad(
         torch.stack(
             [
-                (x - intrinsic[:, 0, 2] + 0.5) / intrinsic[:, 0, 0],
+                (x - intrinsic[:, 0, 2] + 0.5) / intrinsic[:, 0, 0],# 统一用opencv的K反投影
                 (y - intrinsic[:, 1, 2] + 0.5) / intrinsic[:, 1, 1],
             ],
             dim=-1,
         ),
         (0, 1),
         value=1.0,
-    )  # [num_rays, 3]
+    )  # [num_rays, 3] 通过内参矩阵将像素中心(+0.5)反投影到相机坐标系，得到相机坐标系下坐标(xc, yc, 1)，即相机空间像素光线方向 
 
     # rotate the camera rays w.r.t. the camera pose
-    directions = (camera_dirs[:, None, :] * c2w[:, :3, :3]).sum(dim=-1)
-    origins = torch.broadcast_to(c2w[:, :3, -1], directions.shape)
+    directions = (camera_dirs[:, None, :] * c2w[:, :3, :3]).sum(dim=-1)# 世界空间像素光线方向
+    origins = torch.broadcast_to(c2w[:, :3, -1], directions.shape)# 世界空间光心坐标
     # TODO: not sure if we still need direction_norm
-    direction_norm = torch.linalg.norm(directions, dim=-1, keepdims=True)
+    direction_norm = torch.linalg.norm(directions, dim=-1, keepdims=True)# 世界空间像素光线向量模长
     # normalize the ray directions
-    viewdirs = directions / (direction_norm + 1e-8)
+    viewdirs = directions / (direction_norm + 1e-8)# 世界空间像素光线方向单位向量
     return origins, viewdirs, direction_norm
 
 def sparse_lidar_map_downsampler(lidar_depth_map, downscale_factor):
@@ -128,17 +128,17 @@ class CameraData(object):
         self.load_size = [
             int(self.original_size[0] / downscale_when_loading),
             int(self.original_size[1] / downscale_when_loading),
-        ]
+        ]# 加载图像时的尺寸：通过downscale_when_loading参数缩放
         
         # Load the images, dynamic masks, sky masks, etc.
         self.create_all_filelist()
-        self.load_calibrations()
-        self.load_images()
-        self.load_egocar_mask()
+        self.load_calibrations()# 加载当前视角相机内参、畸变参数、外参
+        self.load_images()# 加载当前视角的调整宽高的、去畸变、归一化的图像
+        self.load_egocar_mask()# 某些数据集自车在图像中可见，需要加载自车mask来除去自车(waymo和da自车不可见)
         if load_dynamic_mask:
-            self.load_dynamic_masks()
+            self.load_dynamic_masks()# 加载当前视角的调整宽高、去畸变的精炼动态mask、动态人mask、动态车mask
         if load_sky_mask:
-            self.load_sky_masks()
+            self.load_sky_masks()# 加载当前视角的调整宽高、去畸变的天空mask
         self.lidar_depth_maps = None # will be loaded by: self.load_depth()
         self.image_error_maps = None # will be built by: self.build_image_error_buffer()
         self.to(self.device)
@@ -245,7 +245,7 @@ class CameraData(object):
             rgb = rgb.resize(
                 (self.load_size[1], self.load_size[0]), Image.BILINEAR
             )
-            # undistort the images
+            # undistort the images 利用相机内参和畸变参数对图像进行去畸变处理，得到畸变修正图像
             if self.undistort:
                 if ix == 0:
                     print("undistorting rgb")
@@ -293,7 +293,7 @@ class CameraData(object):
             dyn_mask = dyn_mask.resize(
                 (self.load_size[1], self.load_size[0]), Image.BILINEAR
             )
-            if self.undistort:
+            if self.undistort:# 去畸变 
                 if ix == 0:
                     print("undistorting dynamic mask")
                 dyn_mask = cv2.undistort(
@@ -385,7 +385,7 @@ class CameraData(object):
         normalized_time: Tensor,
     ):
         self.normalized_time = normalized_time.to(self.device)
-        
+    # 构建每个相机的图像误差张量
     def build_image_error_buffer(self) -> None:
         """
         Build the image error buffer.
@@ -399,7 +399,7 @@ class CameraData(object):
             ),
             dtype=torch.float32,
             device=self.device,
-        )
+        )# 当前视角的三维图像误差张量：降采样，初始化为全1，表示每个像素平均采样，后续会根据渲染结果更新图像误差张量，图像误差大的像素会被赋予更大的采样权重，从而在训练过程中被优先采样
         
     def get_image_error_video(self) -> List[np.ndarray]:
         """
@@ -488,7 +488,7 @@ class CameraData(object):
         egocar_mask = None
         
         if self.images is not None:
-            rgb = self.images[frame_idx]
+            rgb = self.images[frame_idx]# 图像帧索引对应的rgb图像
             if self.downscale_factor != 1.0:
                 rgb = (
                     torch.nn.functional.interpolate(
@@ -499,7 +499,7 @@ class CameraData(object):
                     )
                     .squeeze(0)
                     .permute(1, 2, 0)
-                )
+                )# 下采样图像帧
                 img_height, img_width = rgb.shape[:2]
             else:
                 img_height, img_width = self.HEIGHT, self.WIDTH
@@ -510,8 +510,8 @@ class CameraData(object):
             indexing="xy",
         )
         x, y = x.flatten(), y.flatten()
-        x, y = x.to(self.device), y.to(self.device)
-        # pixel coordinates
+        x, y = x.to(self.device), y.to(self.device)# 二维像素网格
+        # pixel coordinates归一化像素坐标
         pixel_coords = (
             torch.stack([y / img_height, x / img_width], dim=-1)
             .float()
@@ -530,7 +530,7 @@ class CameraData(object):
                     .squeeze(0)
                 )
         if self.sky_masks is not None:
-            sky_mask = self.sky_masks[frame_idx]
+            sky_mask = self.sky_masks[frame_idx]#  图像帧索引对应的天空掩码
             if self.downscale_factor != 1.0:
                 sky_mask = (
                     torch.nn.functional.interpolate(
@@ -542,7 +542,7 @@ class CameraData(object):
                     .squeeze(0)
                 )
         if self.dynamic_masks is not None:
-            dynamic_mask = self.dynamic_masks[frame_idx]
+            dynamic_mask = self.dynamic_masks[frame_idx]# 图像帧索引对应的动态掩码
             if self.downscale_factor != 1.0:
                 dynamic_mask = (
                     torch.nn.functional.interpolate(
@@ -554,7 +554,7 @@ class CameraData(object):
                     .squeeze(0)
                 )
         if self.human_masks is not None:
-            human_mask = self.human_masks[frame_idx]
+            human_mask = self.human_masks[frame_idx]# 图像帧索引对应的动态人体掩码
             if self.downscale_factor != 1.0:
                 human_mask = (
                     torch.nn.functional.interpolate(
@@ -566,7 +566,7 @@ class CameraData(object):
                     .squeeze(0)
                 )
         if self.vehicle_masks is not None:
-            vehicle_mask = self.vehicle_masks[frame_idx]
+            vehicle_mask = self.vehicle_masks[frame_idx]# 图像帧索引对应的动态车辆掩码
             if self.downscale_factor != 1.0:
                 vehicle_mask = (
                     torch.nn.functional.interpolate(
@@ -580,7 +580,7 @@ class CameraData(object):
             
         lidar_depth_map = None
         if self.lidar_depth_maps is not None:
-            lidar_depth_map = self.lidar_depth_maps[frame_idx]
+            lidar_depth_map = self.lidar_depth_maps[frame_idx]# 图像帧索引对应的深度图像
             if self.downscale_factor != 1.0:
                 # BUG: cannot use, need futher investigation
                 # if self.data_cfg.denser_lidar_times > 1:
@@ -605,26 +605,26 @@ class CameraData(object):
                 (img_height, img_width),
                 self.normalized_time[frame_idx],
                 dtype=torch.float32,
-            )
+            )# 二维像素网格的归一化时间戳(一样)。self.normalized_time-归一化时间戳，0-1之间等间隔取100个时间步
         camera_id = torch.full(
             (img_height, img_width),
             self.cam_id,
             dtype=torch.long,
-        )
+        )# 二维像素网格的相机id(一样)
         image_id = torch.full(
             (img_height, img_width),
             self.unique_img_idx[frame_idx],
             dtype=torch.long,
-        )
+        )# 二维像素网格的图像帧索引(一样)
         frame_id = torch.full(
             (img_height, img_width),
             frame_idx,
             dtype=torch.long,
-        )
-        c2w = self.cam_to_worlds[frame_idx]
-        intrinsics = self.intrinsics[frame_idx] * self.downscale_factor
+        )# 二维像素网格的时间帧id(一样)
+        c2w = self.cam_to_worlds[frame_idx]# 图像帧对应的c2w
+        intrinsics = self.intrinsics[frame_idx] * self.downscale_factor# 图像帧对应的下采样内参
         intrinsics[2, 2] = 1.0
-        origins, viewdirs, direction_norm = get_rays(x, y, c2w, intrinsics)
+        origins, viewdirs, direction_norm = get_rays(x, y, c2w, intrinsics)# 图像帧对应的世界空间像素光心坐标、像素光线方向单位向量、像素光线方向模长
         origins = origins.reshape(img_height, img_width, 3)
         viewdirs = viewdirs.reshape(img_height, img_width, 3)
         direction_norm = direction_norm.reshape(img_height, img_width, 1)
@@ -644,7 +644,7 @@ class CameraData(object):
             "egocar_masks": egocar_mask,
             "lidar_depth_map": lidar_depth_map,
         }
-        image_infos = {k: v for k, v in _image_infos.items() if v is not None}
+        image_infos = {k: v for k, v in _image_infos.items() if v is not None}# 图像帧索引对应的目标图像信息
         
         cam_infos = {
             "cam_id": camera_id,
@@ -653,7 +653,7 @@ class CameraData(object):
             "height": torch.tensor(img_height, dtype=torch.long, device=c2w.device),
             "width": torch.tensor(img_width, dtype=torch.long, device=c2w.device),
             "intrinsics": intrinsics,
-        }
+        }# 图像帧索引对应的相机信息
         return image_infos, cam_infos
 
 class ScenePixelSource(abc.ABC):
@@ -713,22 +713,22 @@ class ScenePixelSource(abc.ABC):
         Load the object annotations.
         """
         raise NotImplementedError
-
+    # 加载图像信息、实例信息、每个视角的初始下采样因子
     def load_data(self) -> None:
         """
         A general function to load all data.
         """
-        self.load_cameras()
-        self.build_image_error_buffer()
+        self.load_cameras()# # 加载所有视角的相机参数、图像、掩码、归一化时间、相机索引、每一帧图像的唯一索引，存入camera_data字典
+        self.build_image_error_buffer()# 构建所有视角的图像误差张量，存入camera_data字典
         logger.info("[Pixel] All Pixel Data loaded.")
         
         if self.data_cfg.load_objects:
-            self.load_objects()
+            self.load_objects()# 加载实例相关信息，包括所有时间帧实例坐标系在新世界坐标系位姿、实例平均尺寸、每一帧所包含的有效实例标记、实例id、实例类别对应的节点类型索引，以及人体SMPL参数（如果需要加载）
             logger.info("[Pixel] All Object Annotations loaded.")
         
         # set initial downscale factor
         for cam_id in self.camera_list:
-            self.camera_data[cam_id].set_downscale_factor(self._downscale_factor)
+            self.camera_data[cam_id].set_downscale_factor(self._downscale_factor)# 设置每个视角的初始下采样因子
 
     def to(self, device: torch.device) -> "ScenePixelSource":
         """
@@ -795,7 +795,7 @@ class ScenePixelSource(abc.ABC):
             front_camera.cam_to_worlds is not None
         ), "Camera poses not loaded, cannot compute front camera trajectory."
         return front_camera.cam_to_worlds[:, :3, 3]
-    
+    # 根据图像帧索引得到对应相机索引和时间帧索引
     def parse_img_idx(self, img_idx: int) -> Tuple[int, int]:
         """
         Parse the image index to the camera index and frame index.
@@ -808,7 +808,7 @@ class ScenePixelSource(abc.ABC):
         unique_cam_idx = img_idx % self.num_cams
         frame_idx = img_idx // self.num_cams
         return unique_cam_idx, frame_idx
-
+    # 根据图像帧索引得到对应的目标图像和相机信息
     def get_image(self, img_idx: int) -> Dict[str, Tensor]:
         """
         Get the rays for rendering the given image index.
@@ -817,7 +817,7 @@ class ScenePixelSource(abc.ABC):
         Returns:
             a dict containing the rays for rendering the given image index.
         """
-        unique_cam_idx, frame_idx = self.parse_img_idx(img_idx)
+        unique_cam_idx, frame_idx = self.parse_img_idx(img_idx)# 根据图像帧索引得到对应相机索引和时间帧索引
         for cam_id in self.camera_list:
             if unique_cam_idx == self.camera_data[cam_id].unique_cam_idx:
                 return self.camera_data[cam_id].get_image(frame_idx)
@@ -889,7 +889,7 @@ class ScenePixelSource(abc.ABC):
         # normalized timestamps are between 0 and 1
         normalized_time = (self._timesteps - self._timesteps.min()) / (
             self._timesteps.max() - self._timesteps.min()
-        )
+        )# 当前视角归一化时间戳，将时间戳归一化到0和1之间
         
         self._normalized_time = normalized_time.to(self.device)
         self._unique_normalized_timestamps = self._normalized_time.unique()
@@ -905,7 +905,7 @@ class ScenePixelSource(abc.ABC):
         return torch.argmin(
             torch.abs(self._normalized_time - normed_timestamp)
         )
-    
+    # 从训练图像帧索引中随机选取训练图像帧
     def propose_training_image(
         self,
         candidate_indices: Tensor = None,
@@ -930,17 +930,17 @@ class ScenePixelSource(abc.ABC):
             ).item()
             img_idx = candidate_indices[idx]
         else:
-            # random sample one from candidate_indices
+            # random sample one from candidate_indices从训练图像帧中随机采样一帧
             img_idx = random.choice(candidate_indices)
             
         return img_idx
-        
+    # 构建所有相机的图像误差张量
     def build_image_error_buffer(self) -> None:
         """
         Build the image error buffer.
         """
         if self.buffer_ratio > 0:
-            for cam_id in self.camera_list:
+            for cam_id in self.camera_list:# 遍历每个相机，构建每个相机的图像误差张量
                 self.camera_data[cam_id].build_image_error_buffer()
         else:
             logger.info("Not building image error buffer because buffer_ratio <= 0.")
@@ -1066,7 +1066,7 @@ class ScenePixelSource(abc.ABC):
             buffer_downscale: the downscale factor of the image error buffer
         """
         return self.data_cfg.sampler.buffer_downscale
-    
+    # 准备新轨迹渲染的相机信息和图像信息
     def prepare_novel_view_render_data(self, dataset_type: str, traj: torch.Tensor) -> list:
         """
         Prepare all necessary elements for novel view rendering.
@@ -1093,7 +1093,7 @@ class ScenePixelSource(abc.ABC):
         normed_time = torch.linspace(0, 1, len(traj))
         
         render_data = []
-        for i in range(len(traj)):
+        for i in range(len(traj)):# 遍历时间步
             c2w = traj[i]
             
             # Generate ray origins and directions
@@ -1110,7 +1110,7 @@ class ScenePixelSource(abc.ABC):
                 "intrinsics": intrinsics,
                 "height": torch.tensor([H], dtype=torch.long, device=self.device),
                 "width": torch.tensor([W], dtype=torch.long, device=self.device),
-            }
+            }# 单个时间步相机信息，包括相机外参、内参、图像高度和宽度
             
             image_infos = {
                 "origins": origins,
@@ -1122,11 +1122,11 @@ class ScenePixelSource(abc.ABC):
                 "pixel_coords": torch.stack(
                     [y.float() / H, x.float() / W], dim=-1
                 ),  # [H, W, 2]
-            }
+            }# 单个时间步图像信息，包括像素光心坐标、像素光线方向单位向量、像素光线方向模长、图像帧索引、时间帧索引、归一化时间戳、归一化像素坐标
             
             render_data.append({
                 "cam_infos": cam_infos,
                 "image_infos": image_infos,
-            })
+            })# 按时间步排列的相机信息和图像信息
         
         return render_data

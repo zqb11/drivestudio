@@ -112,11 +112,11 @@ def projection_matrix(znear, zfar, fovx, fovy, device:Union[str,torch.device]="c
 @dataclass
 class dataclass_camera:
     camtoworlds: torch.Tensor
-    camtoworlds_gt: torch.Tensor
+    camtoworlds_gt: torch.Tensor# 真值相机位姿，用于计算相机位姿损失，优化相机轨迹
     Ks: torch.Tensor
     H: int
     W: int
-
+# 是否冻结属性，不参与训练：若在detach_keys中，属性冻结，反之可以训练
 @dataclass
 class dataclass_gs:
     _opacities: torch.Tensor

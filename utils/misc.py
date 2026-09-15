@@ -47,6 +47,7 @@ def export_points_to_ply(
     pcd.colors = o3d.utility.Vector3dVector(colors)
     o3d.io.write_point_cloud(save_path, pcd)
 
+#将模型的高斯分布数据导出为ply格式的点云文件，包含位置、颜色、法线、SH系数、透明度、尺度和旋转信息。
 def export_gaussians_to_ply(model, path, name='point_cloud.ply', aabb=None):
     model.eval()
     filename = os.path.join(path, name)
@@ -66,11 +67,11 @@ def export_gaussians_to_ply(model, path, name='point_cloud.ply', aabb=None):
             vis_mask = torch.ones_like(positions[:, 0], dtype=torch.bool)
             
         positions = ((positions[vis_mask] - aabb_center) / aabb_sacle_max).cpu().numpy()
-        map_to_tensors["positions"] = o3d.core.Tensor(positions, o3d.core.float32)
-        map_to_tensors["normals"] = o3d.core.Tensor(np.zeros_like(positions), o3d.core.float32)
+        map_to_tensors["positions"] = o3d.core.Tensor(positions, o3d.core.float32)# 位置属性存入
+        map_to_tensors["normals"] = o3d.core.Tensor(np.zeros_like(positions), o3d.core.float32)# 法线属性存入，暂时设置为全零
 
         colors = model.colors[vis_mask].data.cpu().numpy()
-        map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
+        map_to_tensors["colors"] = (colors * 255).astype(np.uint8)# 颜色属性存入，并将颜色值从[0, 1]范围转换为[0, 255]范围的整数类型
         for i in range(colors.shape[1]):
             map_to_tensors[f"f_dc_{i}"] = colors[:, i : i + 1]
 
@@ -78,21 +79,21 @@ def export_gaussians_to_ply(model, path, name='point_cloud.ply', aabb=None):
         if model.config.sh_degree > 0:
             shs = shs.reshape((colors.shape[0], -1, 1))
             for i in range(shs.shape[-1]):
-                map_to_tensors[f"f_rest_{i}"] = shs[:, i]
+                map_to_tensors[f"f_rest_{i}"] = shs[:, i]# SH系数属性存入
 
-        map_to_tensors["opacity"] = model.opacities[vis_mask].data.cpu().numpy()
+        map_to_tensors["opacity"] = model.opacities[vis_mask].data.cpu().numpy()# 透明度属性存入
 
         scales = model.scales[vis_mask].data.cpu().unsqueeze(-1).numpy()
         for i in range(3):
-            map_to_tensors[f"scale_{i}"] = scales[:, i]
+            map_to_tensors[f"scale_{i}"] = scales[:, i]# 缩放属性存入
 
         quats = model.quats[vis_mask].data.cpu().unsqueeze(-1).numpy()
 
         for i in range(4):
-            map_to_tensors[f"rot_{i}"] = quats[:, i]
+            map_to_tensors[f"rot_{i}"] = quats[:, i]# 旋转属性存入
 
-    pcd = o3d.t.geometry.PointCloud(map_to_tensors)
-    o3d.t.io.write_point_cloud(str(filename), pcd)
+    pcd = o3d.t.geometry.PointCloud(map_to_tensors)# 创建open3d点云对象，并将之前存储的各种属性添加到点云对象中
+    o3d.t.io.write_point_cloud(str(filename), pcd)# 将点云对象写入到指定路径的PLY文件中
     
     logger.info(f"Exported point cloud to {filename}, containing {vis_mask.sum().item()} points.")
 

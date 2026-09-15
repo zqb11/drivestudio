@@ -24,7 +24,7 @@ from torch.nn import Parameter
 from models.gaussians.basics import *
 
 logger = logging.getLogger()
-
+# 普通高斯(背景节点高斯)
 class VanillaGaussians(nn.Module):
 
     def __init__(
@@ -50,59 +50,72 @@ class VanillaGaussians(nn.Module):
         self.step = 0
         
         self.device = device
-        self.ball_gaussians=self.ctrl_cfg.get("ball_gaussians", False)
+        self.ball_gaussians = self.ctrl_cfg.get("ball_gaussians", False)
         self.gaussian_2d = self.ctrl_cfg.get("gaussian_2d", False)
         
         # for evaluation
         self.in_test_set = False
         
-        # init models
+        # init models初始化背景高斯
         self.xys_grad_norm = None
         self.max_2Dsize = None
-        self._means = torch.zeros(1, 3, device=self.device)
+        self._means = torch.zeros(1, 3, device=self.device)# (1, 3)全0均值
         if self.ball_gaussians:
             self._scales = torch.zeros(1, 1, device=self.device)
         else:
             if self.gaussian_2d:
                 self._scales = torch.zeros(1, 2, device=self.device)
             else:
-                self._scales = torch.zeros(1, 3, device=self.device)
-        self._quats = torch.zeros(1, 4, device=self.device)
-        self._opacities = torch.zeros(1, 1, device=self.device)
-        self._features_dc = torch.zeros(1, 3, device=self.device)
-        self._features_rest = torch.zeros(1, num_sh_bases(self.sh_degree) - 1, 3, device=self.device)
+                self._scales = torch.zeros(1, 3, device=self.device)# (1, 3)全0尺度
+        self._quats = torch.zeros(1, 4, device=self.device)# (1, 4)全0旋转四元数
+        self._opacities = torch.zeros(1, 1, device=self.device)# (1, 1)全0透明度
+        # 球谐系数
+        self._features_dc = torch.zeros(1, 3, device=self.device)# 全0初始化0阶SH系数
+        self._features_rest = torch.zeros(1, num_sh_bases(self.sh_degree) - 1, 3, device=self.device)# 全0初始化高阶SH系数：(1, 除去0阶的SH系数个数, 3)
         
     @property
     def sh_degree(self):
         return self.ctrl_cfg.sh_degree
-
+    # 从背景采样点初始化背景高斯
     def create_from_pcd(self, init_means: torch.Tensor, init_colors: torch.Tensor) -> None:
-        self._means = Parameter(init_means)
-        
-        distances, _ = k_nearest_sklearn(self._means.data, 3)
-        distances = torch.from_numpy(distances)
+        # Validate input point clouds are not empty
+        if init_means.shape[0] == 0:
+            logger.error(f"[{self.class_prefix.rstrip('#')}] Point cloud is empty! init_means shape: {init_means.shape}")
+            logger.error(f"[{self.class_prefix.rstrip('#')}] This usually indicates:")
+            logger.error(f"[{self.class_prefix.rstrip('#')}]   1. LiDAR data was not loaded correctly")
+            logger.error(f"[{self.class_prefix.rstrip('#')}]   2. All sampled points were filtered out")
+            logger.error(f"[{self.class_prefix.rstrip('#')}]   3. Dataset is corrupted or incompatible")
+            raise ValueError(f"Cannot initialize {self.class_prefix.rstrip('#')} Gaussians with empty point cloud")
+
+        self._means = Parameter(init_means)# 从坐标初始化位置
+
+        distances, _ = k_nearest_sklearn(self._means.data, 3)# 计算每个高斯中心点到其最近的3个点的距离
+        distances = torch.from_numpy(distances)# 转为torch张量
         # find the average of the three nearest neighbors for each point and use that as the scale
-        avg_dist = distances.mean(dim=-1, keepdim=True).to(self.device)
-        if self.ball_gaussians:
+        avg_dist = distances.mean(dim=-1, keepdim=True).to(self.device)# 计算每个高斯中心点到其最近的3个点的平均距离
+        if self.ball_gaussians:# 如果是球形高斯，尺度是1D
             self._scales = Parameter(torch.log(avg_dist.repeat(1, 1)))
         else:
-            if self.gaussian_2d:
+            if self.gaussian_2d:# 如果是2D高斯，尺度是2D
                 self._scales = Parameter(torch.log(avg_dist.repeat(1, 2)))
-            else:
-                self._scales = Parameter(torch.log(avg_dist.repeat(1, 3)))
-        self._quats = Parameter(random_quat_tensor(self.num_points).to(self.device))
-        dim_sh = num_sh_bases(self.sh_degree)
+            else:# 如果是3D高斯，尺度是3D
+                self._scales = Parameter(torch.log(avg_dist.repeat(1, 3)))# 从平均距离的对数初始化尺度，xyz方向尺度一致，点越稀疏的地方高斯椭球初始化越大
+        self._quats = Parameter(random_quat_tensor(self.num_points).to(self.device))# 从随机旋转四元数初始化朝向
+        dim_sh = num_sh_bases(self.sh_degree)# 由阶数得到的累计SH基函数/SH系数个数
 
-        fused_color = RGB2SH(init_colors) # float range [0, 1] 
-        shs = torch.zeros((fused_color.shape[0], dim_sh, 3)).float().to(self.device)
+        fused_color = RGB2SH(init_colors) # float range [0, 1]将rgb转化成0阶SH系数
+        shs = torch.zeros((fused_color.shape[0], dim_sh, 3)).float().to(self.device)# 全0初始化SH系数，shape=(高斯个数, SH系数个数, 3)
         if self.sh_degree > 0:
-            shs[:, 0, :3] = fused_color
-            shs[:, 1:, 3:] = 0.0
+            shs[:, 0, :3] = fused_color# 用采样点rgb初始化0阶SH系数
+            shs[:, 1:, :3] = 0.0# 全0初始化高阶SH系数
         else:
             shs[:, 0, :3] = torch.logit(init_colors, eps=1e-10)
-        self._features_dc = Parameter(shs[:, 0, :])
-        self._features_rest = Parameter(shs[:, 1:, :])
-        self._opacities = Parameter(torch.logit(0.1 * torch.ones(self.num_points, 1, device=self.device)))
+        self._features_dc = Parameter(shs[:, 0, :])# 0阶SH参数
+        self._features_rest = Parameter(shs[:, 1:, :])# 高阶SH参数
+        # Initialize opacity to 0.1 (logit space: -2.1972) for all points, NOT 0
+        self._opacities = Parameter(torch.logit(torch.full((self.num_points, 1), 0.1, device=self.device), eps=1e-7))# 用0.1初始化不透明度
+
+        logger.info(f"[{self.class_prefix.rstrip('#')}] Successfully initialized {self.num_points} Gaussians with opacity init value 0.1")
         
     @property
     def colors(self):
@@ -147,7 +160,7 @@ class VanillaGaussians(nn.Module):
     
     def preprocess_per_train_step(self, step: int):
         self.step = step
-        
+    # 背景高斯训练后处理
     def postprocess_per_train_step(
         self,
         step: int,
@@ -156,10 +169,10 @@ class VanillaGaussians(nn.Module):
         xys_grad: torch.Tensor,
         last_size: int,
     ) -> None:
-        self.after_train(radii, xys_grad, last_size)
+        self.after_train(radii, xys_grad, last_size)# 梯度累加
         if step % self.ctrl_cfg.refine_interval == 0:
-            self.refinement_after(step, optimizer)
-
+            self.refinement_after(step, optimizer)# 致密化主体：分裂、复制、修剪、重置不透明度
+    # 梯度累加
     def after_train(
         self,
         radii: torch.Tensor,
@@ -202,7 +215,7 @@ class VanillaGaussians(nn.Module):
     
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         return self.get_gaussian_param_groups()
-
+    # 致密化主体：分裂、复制、修剪、重置不透明度
     def refinement_after(self, step, optimizer: torch.optim.Optimizer) -> None:
         assert step == self.step
         if self.step <= self.ctrl_cfg.warmup_steps:
@@ -374,34 +387,35 @@ class VanillaGaussians(nn.Module):
         dup_scales = self._scales[dup_mask]
         dup_quats = self._quats[dup_mask]
         return dup_means, dup_feature_dc, dup_feature_rest, dup_opacities, dup_scales, dup_quats
-
+    # 获取当前相机位姿下高斯属性(中心点坐标、尺度、朝向、颜色和不透明度)/相机位姿与高斯属性的匹配
     def get_gaussians(self, cam: dataclass_camera) -> Dict:
-        filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)
+        filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)# 与高斯个数一致的全1过滤掩码
         self.filter_mask = filter_mask
         
         # get colors of gaussians
-        colors = torch.cat((self._features_dc[:, None, :], self._features_rest), dim=1)
-        if self.sh_degree > 0:
-            viewdirs = self._means.detach() - cam.camtoworlds.data[..., :3, 3]  # (N, 3)
-            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
-            n = min(self.step // self.ctrl_cfg.sh_degree_interval, self.sh_degree)
-            rgbs = spherical_harmonics(n, viewdirs, colors)
+        colors = torch.cat((self._features_dc[:, None, :], self._features_rest), dim=1)# 球谐系数拼接
+        if self.sh_degree > 0:#球谐函数阶数大于0，即启用球谐函数
+            viewdirs = self._means.detach() - cam.camtoworlds.data[..., :3, 3]  # (N, 3) 相机光心到高斯中心点的方向向量
+            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)# 单位方向向量
+            n = min(self.step // self.ctrl_cfg.sh_degree_interval, self.sh_degree)# 训练技巧：动态退火-随训练步数逐渐解锁更高阶的球谐函数
+            rgbs = spherical_harmonics(n, viewdirs, colors)# 根据相机位姿方向和球谐系数计算像素级高斯颜色
             rgbs = torch.clamp(rgbs + 0.5, 0.0, 1.0)
         else:
             rgbs = torch.sigmoid(colors[:, 0, :])
-            
-        activated_opacities = self.get_opacity
+        # 防止高斯属性出现非法值
+        activated_opacities = self.get_opacity# 0.1
         activated_scales = self.get_scaling
         activated_rotations = self.get_quats
-        actovated_colors = rgbs
-        
+        activated_colors = rgbs
+        # 调试：最小最大不透明度
+        # print(f"Min/Max opacities: {activated_opacities.min()}, {activated_opacities.max()}")
         # collect gaussians information
         gs_dict = dict(
-            _means=self._means[filter_mask],
-            _opacities=activated_opacities[filter_mask],
-            _rgbs=actovated_colors[filter_mask],
-            _scales=activated_scales[filter_mask],
-            _quats=activated_rotations[filter_mask],
+            _means=self._means[filter_mask],# 中心点坐标
+            _opacities=activated_opacities[filter_mask],# 不透明度
+            _rgbs=activated_colors[filter_mask],# 颜色
+            _scales=activated_scales[filter_mask],# 尺度
+            _quats=activated_rotations[filter_mask],# 朝向
         )
         
         # check nan and inf in gs_dict

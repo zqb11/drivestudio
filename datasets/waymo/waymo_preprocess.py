@@ -360,7 +360,7 @@ class WaymoProcessor(object):
             file_idx (int): Current file index.
             frame_idx (int): Current frame index.
         """
-        for img in frame.images:
+        for img in frame.images:# img.name: 0-front, 1-front left, 2-front right, 3-side left, 4-side right
             # dynamic_mask
             img_path = (
                 f"{self.save_dir}/{str(file_idx).zfill(3)}/images/"
@@ -371,11 +371,11 @@ class WaymoProcessor(object):
 
             filter_available = any(
                 [label.num_top_lidar_points_in_box > 0 for label in frame.laser_labels]
-            )
+            )# Check if the current frame includes at least one top-LiDAR-detected object若没有任何一个实例被top LiDAR检测到，结果为false，否则为true
             calibration = next(
                 cc for cc in frame.context.camera_calibrations if cc.name == img.name
-            )
-            for label in frame.laser_labels:
+            )# Extract the camera intrinsic&extrinsic parameters matching the current image
+            for label in frame.laser_labels:# 遍历当前时间帧雷达测出的每个实例
                 # camera_synced_box is not available for the data with flow.
                 # box = label.camera_synced_box
                 
@@ -383,15 +383,15 @@ class WaymoProcessor(object):
                 if class_name not in VALID_CLASSES:
                     continue
 
-                box = label.box
+                box = label.box#   3D box of the object in the current frame
                 meta = label.metadata
                 speed = np.linalg.norm([meta.speed_x, meta.speed_y])
                 if not box.ByteSize():
-                    continue  # Filter out labels that do not have a camera_synced_box.
+                    continue  # note: Filter out labels that do not have a camera_synced_box.排除box为空的实例
                 if (filter_available and not label.num_top_lidar_points_in_box) or (
                     not filter_available and not label.num_lidar_points_in_box
                 ):
-                    continue  # Filter out likely occluded objects.
+                    continue  # #note: Filter out likely occluded objects.条件一：当前帧有实例被top LiDAR检测到，但当前实例没有被top LiDAR检测到，太远了或被遮挡；条件二：当前帧没有任何实例被top LiDAR检测到，且当前实例没有被任何LiDAR检测到，实例在当前空间完全不可见
 
                 # Retrieve upright 3D box corners.
                 box_coords = np.array(
@@ -409,28 +409,28 @@ class WaymoProcessor(object):
                 )
                 corners = box_utils.get_upright_3d_box_corners(box_coords)[
                     0
-                ].numpy()  # [8, 3]
+                ].numpy()  # [8, 3] 自车坐标系下的8个角点坐标
 
                 # Project box corners from vehicle coordinates onto the image.
                 projected_corners = project_vehicle_to_image(
                     frame.pose, calibration, corners
                 )
-                u, v, ok = projected_corners.transpose()
+                u, v, ok = projected_corners.transpose()# ok是投影点状态标志位，若出现在相机视野内，则为true
                 ok = ok.astype(bool)
 
                 # Skip object if any corner projection failed. Note that this is very
                 # strict and can lead to exclusion of some partially visible objects.
                 if not all(ok):
-                    continue
+                    continue# note: 保留相机视野完全可见（8点都在视野内）的实例，排除相机视野部分可见（8点中有点不在视野内）的实例
                 u = u[ok]
                 v = v[ok]
 
-                # Clip box to image bounds.
+                # note: Clip box to image bounds.
                 u = np.clip(u, 0, calibration.width)
                 v = np.clip(v, 0, calibration.height)
 
                 if u.max() - u.min() == 0 or v.max() - v.min() == 0:
-                    continue
+                    continue# note: 排除投影到图像平面上是线段（长或宽为0）的实例
 
                 # Draw projected 2D box onto the image.
                 xy = (u.min(), v.min())
@@ -446,31 +446,31 @@ class WaymoProcessor(object):
                         int(xy[0]) : int(xy[0] + width),
                     ],
                     speed,
-                )
+                )# note: 在实例的2D边界框区域内，动态mask的值为该实例的速度（m/s）；如果多个实例的边界框区域有重叠，动态mask取重叠区域内所有实例速度的最大值
             # thresholding, use 1.0 m/s to determine whether the pixel is moving
-            dynamic_mask = np.clip((dynamic_mask > 1.0) * 255, 0, 255).astype(np.uint8)
-            dynamic_mask = Image.fromarray(dynamic_mask, "L")
+            dynamic_mask = np.clip((dynamic_mask > 1.0) * 255, 0, 255).astype(np.uint8)# note: 动态mask二值化，速度大于1.0 m/s的像素被认为是动态的，动态像素值为255，非动态像素值为0
+            dynamic_mask = Image.fromarray(dynamic_mask, "L")# note: 将动态mask保存为灰度图像，像素值为0或255
             dynamic_mask_path = os.path.join(mask_dir, f"{str(frame_idx).zfill(3)}_{str(img.name - 1)}.png")
             dynamic_mask.save(dynamic_mask_path)
             
     def save_objects(self, dataset):
         """Parse and save the ground truth bounding boxes."""
-        instances_info, frame_instances = {}, {}
+        instances_info, frame_instances = {}, {}# 当前场景所有实例信息instances_info: {instance_id: {id: , class_name: , frame_annotations: {frame_idx:, obj_to_world:, box_size:}}}; 当前场景所有时间帧对应实例frame_instances: {frame_idx: [instance_id1, instance_id2, ...]}
         
-        for frame_idx, data in enumerate(dataset):
-            frame = dataset_pb2.Frame()
+        for frame_idx, data in enumerate(dataset):# 遍历该场景所有时间帧
+            frame = dataset_pb2.Frame()# 场景
             frame.ParseFromString(bytearray(data.numpy()))
             
             frame_instances[frame_idx] = []
-            for l in frame.laser_labels:
+            for l in frame.laser_labels:# 遍历这个时间帧每个实例
                 frame_pose = np.array(frame.pose.transform).reshape(4, 4)
                 
                 str_id = str(l.id)
                 if WAYMO_CLASSES[l.type] not in WAYMO_DYNAMIC_CLASSES:
                     continue
                 
-                frame_instances[frame_idx].append(str_id)
-                
+                frame_instances[frame_idx].append(str_id)# 添加实例id到frame_instances的当前时间帧中
+                # 若实例id不在instances_info中，创建一个新的实例信息字典，并添加到instances_info中；若实例id已经在instances_info中，说明这个实例在之前的时间帧已经出现过了，直接使用之前的实例信息字典
                 if str_id not in instances_info:
                     instances_info[str_id] = dict(
                         id=l.id,
@@ -503,7 +503,7 @@ class WaymoProcessor(object):
                     [ 0,  0,  1, tz],
                     [ 0,  0,  0,  1]])
                 
-                # [object to ENU world]
+                # [object to ENU world] 世界坐标系下实例位姿
                 pose = frame_pose @ o2v # o2w = v2w @ o2v
                 
                 # difficulty = l.detection_difficulty_level
@@ -518,17 +518,17 @@ class WaymoProcessor(object):
                 instances_info[str_id]['frame_annotations']['obj_to_world'].append(pose.tolist())
                 instances_info[str_id]['frame_annotations']['box_size'].append(dimension)
                 
-        # Correct ID mapping
+        # Correct ID mapping 将实例id与序号对应，从0开始
         id_map = {}
         for i, (k, v) in enumerate(instances_info.items()):
             id_map[v["id"]] = i
 
-        # Update keys in instances_info
+        # Update keys in instances_info 更新实例信息字典：将实例id键变成序号
         new_instances_info = {}
         for k, v in instances_info.items():
             new_instances_info[id_map[v["id"]]] = v
 
-        # Update keys in frame_instances
+        # Update keys in frame_instances 更新时间帧实例字典：将实例id值变成序号
         new_frame_instances = {}
         for k, v in frame_instances.items():
             new_frame_instances[k] = [id_map[i] for i in v]

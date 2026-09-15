@@ -1,0 +1,8 @@
+# scene_id, seg_name, start_timestep, end_timestep
+000,Town01_type001_subtype0001_scenario00003,1,100
+001,Town02_type001_subtype0001_scenario00013,1,45
+002,Town03_type001_subtype0001_scenario00024,1,56
+003,Town05_type001_subtype0001_scenario00007,1,53
+004,Town07_type001_subtype0001_scenario00031,1,60
+005,Town10HD_type001_subtype0001_scenario00003,1,36
+006,Town10HD_type001_subtype0001_scenario00014,1,74

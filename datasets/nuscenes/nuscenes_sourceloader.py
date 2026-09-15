@@ -72,7 +72,7 @@ class NuScenesCameraData(CameraData):
     def load_calibrations(self):
         cam_to_worlds, intrinsics, distortions = [], [], []
         
-        # Load the first camera (front) pose to align the world
+        # Load the first camera (front) pose to align the world首帧front相机坐标系作为世界坐标系
         camera_front_start = np.loadtxt(
             os.path.join(self.data_path, "extrinsics", f"{self.start_timestep:03d}_0.txt")
         )

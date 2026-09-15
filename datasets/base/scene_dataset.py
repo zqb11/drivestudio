@@ -72,7 +72,7 @@ class SceneDataset(abc.ABC):
     @abc.abstractmethod
     def split_train_test(self):
         raise NotImplementedError
-
+    # 获得贴合场景的aabb最小点和最大点，即场景边界框
     def get_aabb(self) -> Tensor:
         if self.lidar_source is not None:
             aabb = self.lidar_source.get_aabb()

@@ -85,8 +85,8 @@ class SMPLTemplate(nn.Module):
         super().__init__()
         assert num_human == init_beta.shape[0], "num_human should be the same as the number of beta"
         self.num_human = num_human
-        self.dim = 24
-        self._template_layer = SMPLLayer(model_path=smpl_model_path)
+        self.dim = 24# smpl实例中关节个数
+        self._template_layer = SMPLLayer(model_path=smpl_model_path)# 加载标准smpl模型
 
         init_beta = torch.as_tensor(init_beta, dtype=torch.float32).cpu()
         self.register_buffer("init_beta", init_beta)
@@ -258,7 +258,7 @@ def init_qso_on_mesh(
 
     ret_o = torch.ones_like(v_init[:, :1]) * opacity_base_logit
     return ret_q, ret_s, ret_o
-
+# 从平均模板网格上初始化高斯点的四类属性：位置、朝向、缩放、不透明度
 def get_on_mesh_init_geo_values(
     template,
     opacity_init_logit, 
@@ -269,10 +269,10 @@ def get_on_mesh_init_geo_values(
     min_scale = 0.0,
     s_inv_act = torch.logit,
 ):
-    v, f = template.get_init_vf()
+    v, f = template.get_init_vf()# 以每个实例自己的 beta（体型参数）和固定的 da_pose跑一次 SMPL 前向，得到每个实例的平均模板网格顶点和面片
     x_all, q_all, s_all, o_all = [], [], [], []
-    for i in range(len(v)):
-        x, mesh = init_xyz_on_mesh(v[i], f, on_mesh_subdivide)
+    for i in range(len(v)):# 遍历每个人体实例
+        x, mesh = init_xyz_on_mesh(v[i], f, on_mesh_subdivide)# 用平均模板的原始顶点（默认不增加顶点）初始化高斯位置
         q, s, o = init_qso_on_mesh(
             mesh,
             scale_init_factor,
@@ -281,7 +281,7 @@ def get_on_mesh_init_geo_values(
             min_scale,
             s_inv_act,
             opacity_init_logit,
-        )
+        )# 朝向：局部z轴指向法线，局部xy轴在切平面上随机；尺度：根据每个顶点的邻域三角形面积，xy方向尺度是顶点半径，z方向尺度是顶点半径*厚度初始化因子；不透明度：固定值
         
         x_all.append(x)
         q_all.append(q)

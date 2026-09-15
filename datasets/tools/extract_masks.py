@@ -99,7 +99,7 @@ if __name__ == "__main__":
         args.config = os.path.join(args.segformer_path, 'local_configs', 'segformer', 'B5', 'segformer.b5.1024x1024.city.160k.py')
     if args.checkpoint is None:
         args.checkpoint = os.path.join(args.segformer_path, 'pretrained', 'segformer.b5.1024x1024.city.160k.pth')
-    
+    # 加载场景id列表
     if args.scene_ids is not None:
         scene_ids_list = args.scene_ids
     elif args.split_file is not None:
@@ -114,10 +114,10 @@ if __name__ == "__main__":
         scene_ids_list = np.arange(args.start_idx, args.start_idx + args.num_scenes)
     
     model = init_segmentor(args.config, args.checkpoint, device=args.device)
-    
+    # 遍历所有场景
     for scene_i, scene_id in enumerate(tqdm(scene_ids_list, f'Extracting Masks ...')):
-        scene_id = str(scene_id).zfill(3)
-        img_dir = os.path.join(args.data_root, scene_id, args.rgb_dirname)
+        scene_id = str(scene_id).zfill(3)# 场景名，如"000", "001", ... 
+        img_dir = os.path.join(args.data_root, scene_id, args.rgb_dirname)# 图像目录路径
         
         # create mask dir
         sky_mask_dir = os.path.join(args.data_root, scene_id, "sky_masks")
@@ -140,7 +140,7 @@ if __name__ == "__main__":
                 os.makedirs(vehicle_mask_dir)
         
         flist = sorted(glob(os.path.join(img_dir, '*')))
-        for fpath in tqdm(flist, f'scene[{scene_id}]'):
+        for fpath in tqdm(flist, f'scene[{scene_id}]'):# 遍历所有图片
             fbase = os.path.splitext(os.path.basename(os.path.normpath(fpath)))[0]
     
             # if args.no_compress:
@@ -153,31 +153,31 @@ if __name__ == "__main__":
             
             #---- Inference and save outputs
             result = inference_segmentor(model, fpath)
-            mask = result[0].astype(np.uint8)   # NOTE: in the settings of "cityscapes", there are 19 classes at most.
+            mask = result[0].astype(np.uint8)# 与图像同分辨率的语义分割掩码数组，值是类别∈[0, 18]   # NOTE: in the settings of "cityscapes", there are 19 classes at most.
             # if args.no_compress:
             #     np.save(mask_fpath, mask)
             # else:
             #     np.savez_compressed(mask_fpath, mask)   # NOTE: compressed files are 100x smaller.
 
             # save sky mask
-            sky_mask = np.isin(mask, [10])
+            sky_mask = np.isin(mask, [10])# 检查mask每个元素是否为10，为10返回true，否则返回false，即true像素为天空像素
             imageio.imwrite(os.path.join(sky_mask_dir, f"{fbase}.png"), sky_mask.astype(np.uint8)*255)
             
             if args.process_dynamic_mask:
                 # save human masks
                 rough_human_mask_path = os.path.join(rough_human_mask_dir, f"{fbase}.png")
-                rough_human_mask = (imageio.imread(rough_human_mask_path) > 0)
-                huamn_mask = np.isin(mask, dataset_classes_in_sematic['human'])
-                valid_human_mask = np.logical_and(huamn_mask, rough_human_mask)
+                rough_human_mask = (imageio.imread(rough_human_mask_path) > 0)# 粗糙人类掩码布尔数组：基于dynamic_masks得到，true是人类像素
+                huamn_mask = np.isin(mask, dataset_classes_in_sematic['human'])# 分割人类掩码布尔数组：基于分割模型和images得到，检查mask每个元素是否为人类类别，为人类类别返回true，否则返回false
+                valid_human_mask = np.logical_and(huamn_mask, rough_human_mask)# 精细人类掩码布尔数组：粗糙和分割取交集，都为人类像素才为人类像素
                 imageio.imwrite(os.path.join(human_mask_dir, f"{fbase}.png"), valid_human_mask.astype(np.uint8)*255)
                 
                 # save vehicle mask
                 rough_vehicle_mask_path = os.path.join(rough_vehicle_mask_dir, f"{fbase}.png")
                 rough_vehicle_mask = (imageio.imread(rough_vehicle_mask_path) > 0)
                 vehicle_mask = np.isin(mask, dataset_classes_in_sematic['Vehicle'])
-                valid_vehicle_mask = np.logical_and(vehicle_mask, rough_vehicle_mask)
+                valid_vehicle_mask = np.logical_and(vehicle_mask, rough_vehicle_mask)# 精细车辆掩码布尔数组
                 imageio.imwrite(os.path.join(vehicle_mask_dir, f"{fbase}.png"), valid_vehicle_mask.astype(np.uint8)*255)
                 
                 # save dynamic mask
-                valid_all_mask = np.logical_or(valid_human_mask, valid_vehicle_mask)
+                valid_all_mask = np.logical_or(valid_human_mask, valid_vehicle_mask)# 精细动态掩码布尔数组：精细车辆和人类数组取并集
                 imageio.imwrite(os.path.join(all_mask_dir, f"{fbase}.png"), valid_all_mask.astype(np.uint8)*255)

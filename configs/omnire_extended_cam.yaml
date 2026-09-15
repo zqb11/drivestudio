@@ -1,7 +1,7 @@
 seed: 0
-dataset: waymo/3cams
+dataset: deepaccident/6cams
 
-# ------------- Trainer ------------ #
+# ------------- Trainer（训练器超参） ------------ #
 trainer:
   type: models.trainers.MultiTrainer
   optim:
@@ -32,8 +32,8 @@ trainer:
     affine:
       w: 0.00001 # weight of affine regularization
   res_schedule:
-    double_steps: 250 # training starts at 1/d resolution, every n steps this is doubled
-    downscale_times: 2 # at the beginning, resolution is 1/2^d, where d is this number
+    double_steps: 250 # training starts at 1/d resolution, every n steps this is doubled每隔这么多步降采样倍数减半
+    downscale_times: 2 # at the beginning, resolution is 1/2^d, where d is this number降采样倍数的幂
   gaussian_optim_general_cfg:
     xyz:
       lr: 1.6e-04
@@ -67,7 +67,7 @@ trainer:
     stop_split_at: 20000          # stop splitting at this step
     sh_degree: 3                  # sh degree for gaussians
 
-# ------------- Model ------------ #
+# ------------- Model(模型超参) ------------ #
 model:
   Background:
     type: models.gaussians.VanillaGaussians
@@ -266,14 +266,16 @@ render:
   render_novel: 
     traj_types:
       - front_center_interp # type of trajectory for novel view synthesis
-    fps: 24 # frames per second for novel view rendering
+      - s_curve
+      - three_key_poses
+    fps: 10 # frames per second for novel view rendering
   vis_lidar: False # whether to visualize lidar points on ground truth images
   vis_sky: False # whether to include "rgb_sky" and "rgb_sky_blend" in rendered keys
   vis_error: False # whether to include "rgb_error_map" in rendered keys
 
 # ------------- logging ------------ #
 logging:
-  vis_freq: 2000 # how often to visualize training stats
+  vis_freq: 2000 # how often to visualize training stats多少个时间步可视化训练效果
   print_freq: 500 # how often to print training stats
   saveckpt_freq: 20000 # how often to save checkpoints
   save_seperate_video: True # whether to save seperate videos for each scene

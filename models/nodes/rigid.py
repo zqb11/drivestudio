@@ -10,7 +10,7 @@ from models.gaussians.basics import *
 from models.gaussians.vanilla import VanillaGaussians
 
 logger = logging.getLogger()
-
+# 刚性节点高斯，初始化继承普通高斯
 class RigidNodes(VanillaGaussians):
     def __init__(
         self,
@@ -24,18 +24,18 @@ class RigidNodes(VanillaGaussians):
     @property
     def num_frames(self):
         return self.instances_fv.shape[0]
-    
+    # 获得当前时间帧下该类别所有点云是否有效
     def get_pts_valid_mask(self):
         """
         get the mask for valid points
         """
-        return self.instances_fv[self.cur_frame][self.point_ids[..., 0]]
+        return self.instances_fv[self.cur_frame][self.point_ids[..., 0]]# 先得到当前时间帧所有实例是否有效，再根据点云所属实例id得到当前时间帧所有点云是否有效
     
     def set_cur_frame(self, frame_id: int):
         self.cur_frame = frame_id
     def register_normalized_timestamps(self, normalized_timestamps: int):
         self.normalized_timestamps = normalized_timestamps
-        
+    # 从动态实例字典初始化刚性节点高斯
     def create_from_pcd(self, instance_pts_dict: Dict[str, torch.Tensor]) -> None:
         """
         instance_pts_dict: {
@@ -58,7 +58,7 @@ class RigidNodes(VanillaGaussians):
         instances_fv = []
         point_ids = []
         for id_in_model, (id_in_dataset, v) in enumerate(instance_pts_dict.items()):
-            init_means.append(v["pts"])
+            init_means.append(v["pts"])# 用局部坐标系下实例点云坐标初始化刚性节点高斯位置
             init_colors.append(v["colors"])
             instances_pose.append(v["poses"].unsqueeze(1))
             instances_size.append(v["size"])
@@ -74,14 +74,14 @@ class RigidNodes(VanillaGaussians):
         instances_trans = instances_pose[..., :3, 3]
         
         # initialize the means, scales, quats, and colors
-        self._means = Parameter(init_means)
+        self._means = Parameter(init_means)# 从点云坐标初始化均值
         distances, _ = k_nearest_sklearn(self._means.data, 3)
         distances = torch.from_numpy(distances)
-        avg_dist = distances.mean(dim=-1, keepdim=True).to(self.device)
-        avg_dist = avg_dist.clamp(0.002, 100)
-        self._scales = Parameter(torch.log(avg_dist.repeat(1, 3)))
-        self._quats = Parameter(random_quat_tensor(self.num_points).to(self.device))
-        dim_sh = num_sh_bases(self.sh_degree)
+        avg_dist = distances.mean(dim=-1, keepdim=True).to(self.device)# 计算每个高斯中心点到其最近的3个点的平均距离
+        avg_dist = avg_dist.clamp(0.002, 100)# 限制平均距离的范围，避免尺度过小或过大
+        self._scales = Parameter(torch.log(avg_dist.repeat(1, 3)))# 从平均距离初始化尺度
+        self._quats = Parameter(random_quat_tensor(self.num_points).to(self.device))# 从随机旋转四元数初始化朝向
+        dim_sh = num_sh_bases(self.sh_degree)# 球谐系数的组数
         
         # pose refinement
         self.instances_quats = Parameter(self.quat_act(instances_quats)) # (num_frame, num_instances, 4)
@@ -91,12 +91,13 @@ class RigidNodes(VanillaGaussians):
         shs = torch.zeros((fused_color.shape[0], dim_sh, 3)).float().to(self.device)
         if self.sh_degree > 0:
             shs[:, 0, :3] = fused_color
-            shs[:, 1:, 3:] = 0.0
+            shs[:, 1:, :3] = 0.0
         else:
             shs[:, 0, :3] = torch.logit(init_colors, eps=1e-10)
         self._features_dc = Parameter(shs[:, 0, :])
         self._features_rest = Parameter(shs[:, 1:, :])
         self._opacities = Parameter(torch.logit(0.1 * torch.ones(self.num_points, 1, device=self.device)))
+        logger.info(f"[{self.class_prefix.rstrip('#')}] Successfully initialized {self.num_points} Gaussians with opacity init value 0.1")
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = self.get_gaussian_param_groups()
@@ -374,7 +375,7 @@ class RigidNodes(VanillaGaussians):
         global_quats_per_pts = self.quat_act(global_quats_per_pts)
         _quats = self.quat_act(quats)
         return quat_mult(global_quats_per_pts, _quats)
-
+    # 获取当前相机位姿下高斯属性
     def get_gaussians(self, cam: dataclass_camera) -> Dict[str, torch.Tensor]:
         filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)
         self.filter_mask = filter_mask
@@ -394,9 +395,9 @@ class RigidNodes(VanillaGaussians):
         else:
             rgbs = torch.sigmoid(colors[:, 0, :])
         
-        valid_mask = self.get_pts_valid_mask()
+        valid_mask = self.get_pts_valid_mask()# 当前时间帧下刚性节点所有点云是否有效
             
-        activated_opacities = self.get_opacity * valid_mask.float().unsqueeze(-1)
+        activated_opacities = self.get_opacity * valid_mask.float().unsqueeze(-1)# 无效点不透明度设为0，使其在光栅化时完全透明，不会对渲染结果产生影响
         activated_scales = self.get_scaling
         activated_rotations = self.quat_act(world_quats)
         actovated_colors = rgbs

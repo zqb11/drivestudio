@@ -87,7 +87,7 @@ def normalize_depth(depth: Tensor, max_depth: float = 80.0):
 
 def safe_normalize_depth(depth: Tensor, max_depth: float = 80.0):
     return torch.clamp(depth / max_depth, 1e-06, 1.0)
-
+# 深度损失
 class DepthLoss(nn.Module):
     def __init__(
         self,
@@ -100,11 +100,11 @@ class DepthLoss(nn.Module):
     ):
         super().__init__()
         self.loss_type = loss_type
-        self.normalize = normalize
-        self.use_inverse_depth = use_inverse_depth
-        self.upper_bound = upper_bound
-        self.depth_error_percentile = depth_error_percentile
-        self.reduction = reduction
+        self.normalize = normalize# 是否对深度图执行归一化操作
+        self.use_inverse_depth = use_inverse_depth# 是否在逆深度空间(视差)计算损失
+        self.upper_bound = upper_bound# 有效的深度上限，真实深度超过上限的像素点不参与训练
+        self.depth_error_percentile = depth_error_percentile# 深度误差百分数过滤阈值
+        self.reduction = reduction# 如何算整张深度图的损失：mean_on_hit-仅在有效观测点(像素点位置有雷达点且未超过上限)上求平均，即有效像素的损失总和 / 有效像素的总数
 
     def _compute_depth_loss(
         self,
@@ -115,11 +115,13 @@ class DepthLoss(nn.Module):
     ):
         pred_depth = pred_depth.squeeze()
         gt_depth = gt_depth.squeeze()
-        if hit_mask is not None:
+        if hit_mask is not None:# 像素目标深度>0的掩码，即预测深度和目标深度的有效像素位置保持原有深度，无效像素位置为0
             pred_depth = pred_depth * hit_mask
             gt_depth = gt_depth * hit_mask
-        
-        # cal valid mask to make sure gt_depth is valid
+        # 调试：预测深度图和目标深度图有效像素坐标，发现预测深度图有效像素为空，目标深度图有效像素非空
+        # coords_pred = torch.nonzero(pred_depth)
+        # coords_gt = torch.nonzero(gt_depth)
+        # cal valid mask to make sure gt_depth is valid 
         valid_mask = (gt_depth > 0.01) & (gt_depth < max_depth) & (pred_depth > 0.0001)
         
         # normalize depth to (0, 1)
@@ -127,8 +129,8 @@ class DepthLoss(nn.Module):
             pred_depth = safe_normalize_depth(pred_depth[valid_mask], max_depth=max_depth)
             gt_depth = safe_normalize_depth(gt_depth[valid_mask], max_depth=max_depth)
         else:
-            pred_depth = pred_depth[valid_mask]
-            gt_depth = gt_depth[valid_mask]
+            pred_depth = pred_depth[valid_mask]# 空
+            gt_depth = gt_depth[valid_mask]# 空
         
         # inverse the depth map (0, 1) -> (1, +inf)
         if self.use_inverse_depth:
@@ -151,7 +153,7 @@ class DepthLoss(nn.Module):
         gt_depth: Tensor,
         hit_mask: Tensor = None,
     ):
-        depth_error = self._compute_depth_loss(pred_depth, gt_depth, self.upper_bound, hit_mask)
+        depth_error = self._compute_depth_loss(pred_depth, gt_depth, self.upper_bound, hit_mask)# 空
         if self.depth_error_percentile is not None:
             # to avoid outliers. not used for now
             depth_error = depth_error.flatten()
@@ -160,13 +162,18 @@ class DepthLoss(nn.Module):
                     : int(len(depth_error) * self.depth_error_percentile)
                 ]
             ]
-        
+
+        # Handle empty depth_error tensor (no valid pixels)
+        # if depth_error.numel() == 0:
+        #     # Return zero loss when no valid depth samples exist
+        #     return torch.tensor(0.0, device=depth_error.device if depth_error.dim() > 0 else gt_depth.device, dtype=gt_depth.dtype)
+
         if self.reduction == "sum":
             depth_error = depth_error.sum()
         elif self.reduction == "none":
             depth_error = depth_error
         elif self.reduction == "mean_on_hit":
-            depth_error = depth_error.mean()
+            depth_error = depth_error.mean()# nan
         elif self.reduction == "mean_on_hw":
             n = gt_depth.shape[0]*gt_depth.shape[1]
             depth_error = depth_error.sum() / n

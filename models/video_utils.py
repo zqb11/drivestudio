@@ -65,8 +65,8 @@ def render_images(
         compute_metrics=compute_metrics,
         compute_error_map=compute_error_map,
         vis_indices=vis_indices
-    )
-    if compute_metrics:
+    )# 渲染指标
+    if compute_metrics:# 渲染指标打印
         num_samples = len(dataset) if vis_indices is None else len(vis_indices)
         logger.info(f"Eval over {num_samples} images:")
         logger.info(f"\t Full Image  PSNR: {render_results['psnr']:.4f}")
@@ -128,7 +128,7 @@ def render(
         indices = vis_indices if vis_indices is not None else range(len(dataset))
         camera_downscale = trainer._get_downscale_factor()
         for i in tqdm(indices, desc=f"rendering {dataset.split}", dynamic_ncols=True):
-            # get image and camera infos
+            # get image and camera infos(获取测试或完整轨迹渲染所需的图像和相机信息)
             image_infos, cam_infos = dataset.get_image(i, camera_downscale)
             for k, v in image_infos.items():
                 if isinstance(v, Tensor):
@@ -419,7 +419,7 @@ def save_videos(
         )
     return return_frame
 
-
+# 渲染和保存新轨迹视频
 def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30) -> None:
     """
     Perform rendering and save the result as a video.
@@ -435,7 +435,7 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
     writer = imageio.get_writer(save_path, mode='I', fps=fps)
     
     with torch.no_grad():
-        for frame_data in render_data:
+        for frame_data in render_data:# 遍历新轨迹每个时间步，渲染每个时间步的图像
             # Move data to GPU
             for key, value in frame_data["cam_infos"].items():
                 frame_data["cam_infos"][key] = value.cuda(non_blocking=True)

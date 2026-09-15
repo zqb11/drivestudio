@@ -15,19 +15,20 @@ from pytorch3d.ops import knn_points
 
 RGB_tuples = torch.tensor(np.vstack([phalp_colors] * 10), dtype=torch.float32) / 255.0
 logger = logging.getLogger()
-
+# smpl节点高斯，继承普通高斯，初始化点个数、是否用体素deformer布尔值
 class SMPLNodes(RigidNodes):
     def __init__(
         self,
         **kwargs
     ):
-        self.smpl_points_num = 6890
-        super().__init__(**kwargs)
+        self.smpl_points_num = 6890# smpl实例中高斯点个数
+        super().__init__(**kwargs)# 继承普通高斯模型
         
-        self.use_voxel_deformer=self.ctrl_cfg.use_voxel_deformer
+        self.use_voxel_deformer=self.ctrl_cfg.use_voxel_deformer# 是否用体素deformer
         # overide here, because we use only one dimension for scale
         if self.ball_gaussians:
             self._scales = torch.zeros(1, 1, device=self.device)
+
         
     @property
     def num_instances(self):
@@ -35,7 +36,7 @@ class SMPLNodes(RigidNodes):
     @property
     def num_frames(self):
         return self.instances_fv.shape[0]
-    
+    # 从smpl节点的动态实例字典初始化smpl实例高斯属性
     def create_from_pcd(self, instance_pts_dict: Dict[str, torch.Tensor]) -> None:
         """
         instance_pts_dict: {
@@ -65,17 +66,17 @@ class SMPLNodes(RigidNodes):
         instances_quats, instances_trans, instances_size = [], [], []
         instances_fv, point_ids = [], []
         # instances_pts, instances_colors = [], []
-        for id_in_model, (id_in_dataset, v) in enumerate(instance_pts_dict.items()):
-            smpl_qauts.append(v["smpl_quats"][:, 1:, :].unsqueeze(1))
-            instances_quats.append(v["smpl_quats"][:, 0, :].unsqueeze(1))
-            instances_trans.append(v["smpl_trans"].unsqueeze(1))
-            instances_fv.append(v["frame_info"].unsqueeze(1))
-            smpl_betas.append(v["smpl_betas"].unsqueeze(0))
-            instances_size.append(v["size"])
+        for id_in_model, (id_in_dataset, v) in enumerate(instance_pts_dict.items()):# 遍历实例
+            smpl_qauts.append(v["smpl_quats"][:, 1:, :].unsqueeze(1))# 实例关节局部朝向
+            instances_quats.append(v["smpl_quats"][:, 0, :].unsqueeze(1))# 实例全局朝向
+            instances_trans.append(v["smpl_trans"].unsqueeze(1))# 实例位置
+            instances_fv.append(v["frame_info"].unsqueeze(1))# 实例在每个时间帧是否在任一视角可见且有匹配的smpl参数
+            smpl_betas.append(v["smpl_betas"].unsqueeze(0))# 实例体型
+            instances_size.append(v["size"])# 实例长宽高
             # instances_pts.append(v["pts"])
             # instances_colors.append(v["colors"])
-            point_ids.append(torch.full((self.smpl_points_num, 1), id_in_model, dtype=torch.long))
-        
+            point_ids.append(torch.full((self.smpl_points_num, 1), id_in_model, dtype=torch.long))# 高斯点的实例id
+        # 在实例维度分别拼接局部朝向、全局朝向、位置、有效性、体型、长宽高、3D点所属实例id
         smpl_qauts = torch.cat(smpl_qauts, dim=1).to(self.device)                # (num_frame, num_instances, 23, 4)
         instances_quats = torch.cat(instances_quats, dim=1).to(self.device)      # (num_frame, num_instances, 4)
         instances_trans = torch.cat(instances_trans, dim=1).to(self.device)      # (num_frame, num_instances, 3)
@@ -91,15 +92,15 @@ class SMPLNodes(RigidNodes):
             init_beta=smpl_betas,
             cano_pose_type="da_pose",
             use_voxel_deformer=self.use_voxel_deformer
-        )
+        )# 从“大”姿态建立人体的平均模板网格
         if self.use_voxel_deformer:
-            self.template.voxel_deformer.enable_voxel_correction()
+            self.template.voxel_deformer.enable_voxel_correction()# 使用体素变形器修正人体形变
         
-        opacity_init_value = torch.tensor(self.ctrl_cfg.opacity_init_value)
+        opacity_init_value = torch.tensor(self.ctrl_cfg.opacity_init_value)# 初始化不透明度
         x, q, s, o = get_on_mesh_init_geo_values(
             self.template,
             opacity_init_logit=torch.logit(opacity_init_value),
-        )
+        )# 从平均模板网格初始化高斯位置、朝向、尺度、不透明度
         if self.ball_gaussians:
             s = s.mean(-1, keepdim=True)
         x = x.to(dtype=torch.float32, device=self.device)
@@ -115,57 +116,57 @@ class SMPLNodes(RigidNodes):
         
         # NOTE: In the future, we will also use colors of lidars to get the initialization of colors
         self.template = self.template.to(self.device)
-        for fi in range(self.num_frames):
+        for fi in range(self.num_frames):# 遍历每一帧，对当前帧计算局部位姿变换矩阵和全局平移向量
             instance_mask = instances_fv[fi]
             if instance_mask.sum() == 0:
                 continue
 
             theta = torch.cat(
                 (instances_quats[fi].unsqueeze(1), smpl_qauts[fi]), dim=1
-            )
+            )# 当前时间帧smpl节点的全局和关节朝向的四元数表示
             masked_theta = theta[instance_mask]
             masked_theta = masked_theta / masked_theta.norm(dim=-1, keepdim=True)
             W, A = self.template(
                 masked_theta = masked_theta, 
                 instances_mask = instance_mask
-            )
-            T = torch.einsum("bnj, bjrc -> bnrc", W, A)
-            R = T[:, :, :3, :3] # [N, 3, 3]
-            t = T[:, :, :3, 3]  # [N, 3]
+            )# A是当前时间帧smpl节点的关节变换矩阵，W是当前时间帧smpl节点的关节权重
+            T = torch.einsum("bnj, bjrc -> bnrc", W, A)# 顶点的变换矩阵
+            R = T[:, :, :3, :3] # [N, 3, 3]顶点的旋转
+            t = T[:, :, :3, 3]  # [N, 3]顶点的平移
             
             reshaped_means = x.reshape(self.num_instances, self.smpl_points_num, 3)
             deformed_means = torch.einsum(
                 "bnij,bnj->bni", R, reshaped_means[instance_mask]         
-            ) + t  # [N, 6890, 3]
+            ) + t  # [N, 6890, 3]局部位姿变换后的顶点位置
             bbox_min = deformed_means.min(dim=1)[0]
             bbox_max = deformed_means.max(dim=1)[0]
-            local_shift = (bbox_min + bbox_max) / 2
-            instances_trans[fi, instance_mask] = instances_trans[fi, instance_mask] - local_shift
+            local_shift = (bbox_min + bbox_max) / 2# 局部位姿变换后顶点的包围盒中心
+            instances_trans[fi, instance_mask] = instances_trans[fi, instance_mask] - local_shift# 全局平移 = 全局平移-包围盒中心，不考虑局部位姿变换后顶点的包围盒中心的偏移
         
         self._means     = Parameter(x, requires_grad=not self.ctrl_cfg.freeze_x)
         self._scales    = Parameter(s, requires_grad=not self.ctrl_cfg.freeze_s)
-        self._quats     = Parameter(q, requires_grad=not self.ctrl_cfg.freeze_q)
+        self._quats     = Parameter(q, requires_grad=not self.ctrl_cfg.freeze_q)# “da”姿态下朝向，保证贴着皮肤
         self._opacities = Parameter(o, requires_grad=not self.ctrl_cfg.freeze_o)
         
-        self.instances_quats = Parameter(instances_quats.unsqueeze(2)) # (num_frame, num_instances, 1, 4)
+        self.instances_quats = Parameter(instances_quats.unsqueeze(2)) # (num_frame, num_instances, 1, 4)全局朝向
         self.instances_trans = Parameter(instances_trans)              # (num_frame, num_instances, 3)
-        self.smpl_qauts      = Parameter(smpl_qauts)                   # (num_frame, num_instances, 23, 4)
+        self.smpl_qauts      = Parameter(smpl_qauts)                   # (num_frame, num_instances, 23, 4)23个关节的局部朝向
         self.instances_size  = instances_size                          # (num_instances, 3)
         self.point_ids       = point_ids                               # (self.smpl_points_num*num_instances, 1)
         
         dim_sh = num_sh_bases(self.sh_degree)
         # NOTE: init_colors actually is for visualization, we use random color here
         # init_colors = RGB_tuples[self.point_ids.squeeze().cpu()].to(self.device)
-        init_colors  = torch.rand((self.num_points, 3), device=self.device)
+        init_colors  = torch.rand((self.num_points, 3), device=self.device)# 随机初始化rgb
         fused_color  = RGB2SH(init_colors) # float range [0, 1] 
         shs = torch.zeros((fused_color.shape[0], dim_sh, 3)).float().to(self.device)
         if self.sh_degree > 0:
             shs[:, 0, :3] = fused_color
-            shs[:, 1:, 3:] = 0.0
+            shs[:, 1:, :3] = 0.0
         else:
             shs[:, 0, :3] = torch.logit(init_colors, eps=1e-10)
-        self._features_dc   = Parameter(shs[:, 0, :],  requires_grad=not self.ctrl_cfg.freeze_shs_dc)
-        self._features_rest = Parameter(shs[:, 1:, :], requires_grad=not self.ctrl_cfg.freeze_shs_rest)
+        self._features_dc   = Parameter(shs[:, 0, :],  requires_grad=not self.ctrl_cfg.freeze_shs_dc)# 从随机rgb初始化0阶SH系数
+        self._features_rest = Parameter(shs[:, 1:, :], requires_grad=not self.ctrl_cfg.freeze_shs_rest)# 全0初始化高阶SH系数
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = self.get_gaussian_param_groups()
@@ -181,11 +182,11 @@ class SMPLNodes(RigidNodes):
     def num_points(self):
         return self._means.shape[0]
 
-    def update_knn(self, x: torch.Tensor) -> None:
+    def update_knn(self, x: torch.Tensor) -> None:# 最近邻算法更新点的最近邻索引
         reshaped_x = x.reshape(self.num_instances, self.smpl_points_num, 3)
         _, nn_ind, _ = knn_points(reshaped_x, reshaped_x, K=self.ctrl_cfg.knn_neighbors, return_nn=False)
-        self.nn_ind = nn_ind
-    
+        self.nn_ind = nn_ind# 三维张量(num_instances, smpl_points_num, K)，每个点对应的K个最近邻索引 没有调用update_knn，进而没有定义nn_ind，导致后续调用nn_ind时报错
+    # 不做致密化
     def postprocess_per_train_step(
         self,
         step: int,
@@ -341,11 +342,11 @@ class SMPLNodes(RigidNodes):
         return means_container, quats_container
     
     def get_gaussians(self, cam: dataclass_camera) -> Dict[str, torch.Tensor]:
-        filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)
+        filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)# 与高斯个数一致的全1过滤掩码
         self.filter_mask = filter_mask
         # NOTE: hack here, need to consider a gaussian filter for efficient rendering
         
-        instance_mask = self.instances_fv[self.cur_frame]
+        instance_mask = self.instances_fv[self.cur_frame]# [false, false]：当前时间帧smpl实例都不可见，所以没有smpl高斯
         if instance_mask.sum() == 0:
             return None
                 
@@ -366,9 +367,9 @@ class SMPLNodes(RigidNodes):
         else:
             rgbs = torch.sigmoid(colors[:, 0, :])
         
-        valid_mask = self.get_pts_valid_mask()
+        valid_mask = self.get_pts_valid_mask()# 当前时间帧下smpl节点所有点云是否有效
             
-        activated_opacities = self.get_opacity * valid_mask.float().unsqueeze(-1)
+        activated_opacities = self.get_opacity * valid_mask.float().unsqueeze(-1)# 无效点不透明度设为0，使其在光栅化时完全透明，不会对渲染结果产生影响
         if self.ball_gaussians:
             activated_scales = torch.exp(self._scales.repeat(1, 3))
         else:
@@ -460,7 +461,7 @@ class SMPLNodes(RigidNodes):
         
         # knn regularization
         knn_reg = self.reg_cfg.get("knn_reg", None)
-        if knn_reg is not None:
+        if knn_reg is not None and hasattr(self, 'nn_ind') and self.nn_ind is not None:# 若nn_ind未被初始化，跳过KNN正则化
             K = self.ctrl_cfg.knn_neighbors
             instances_mask = self.instances_fv[self.cur_frame]
             nn_ind = self.nn_ind[instances_mask] # (num_instances, smpl_points_num, knn_neighbors)
