@@ -725,20 +725,23 @@ class DrivingDataset(SceneDataset):
                 - "front_center_interp": Interpolate key frames from the front center camera
                 - "s_curve": S-shaped trajectory using the front three cameras
                 - "three_key_poses": Creates a trajectory using three key poses from different cameras
-                - "lane_change": Front center interpolation with a smooth lateral shift into an adjacent lane
+                - "front_center_left_2m": Shift the original DeepAccident front center
+                  camera trajectory 2 meters to the camera's left, preserving its orientations
             target_frames: int
-                The total number of frames for each novel trajectory
+                The total number of frames for interpolated trajectories.
+                "front_center_left_2m" preserves the original frame count without resampling.
             traj_cfgs: Optional[Dict[str, dict]]
                 Per-trajectory-type extra keyword arguments, e.g.
                 {"lane_change": {"direction": "left", "lane_width": 3.5}}
 
         Returns:
             Dict[str, torch.Tensor]: A dictionary where keys are trajectory types and values
-            are the generated novel trajectories, each of shape (target_frames, 4, 4)
+            are the generated novel trajectories, each of shape (N, 4, 4).
+            N is the original frame count for "front_center_left_2m", otherwise target_frames.
         """
         per_cam_poses = {}
         for cam_id in self.pixel_source.camera_list:
-            per_cam_poses[cam_id] = self.pixel_source.camera_data[cam_id].cam_to_worlds# 原始逐相机轨迹
+            per_cam_poses[cam_id] = self.pixel_source.camera_data[cam_id].cam_to_worlds# 原始逐相机轨迹，每一帧是opencv相机坐标系到世界坐标系的变换矩阵
 
         traj_cfgs = traj_cfgs or {}
         novel_trajs = {}# 新相机轨迹

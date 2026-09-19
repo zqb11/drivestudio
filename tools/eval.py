@@ -257,7 +257,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Train Gaussian Splatting for a single scene")    
     # eval
-    parser.add_argument("--resume_from", default="work_dirs/omnire/deepaccident_mini_0_6cams_20260622/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
+    parser.add_argument("--resume_from", default="work_dirs/omnire/deepaccident_mini_0_6cams_20260907/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
     parser.add_argument("--render_video_postfix", type=str, default=None, help="an optional postfix for video")    
     parser.add_argument("--save_catted_videos", type=bool, default=False, help="visualize lidar on image")
     

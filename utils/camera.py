@@ -66,62 +66,134 @@ def get_interp_novel_trajectories(
     target_frames: int = 100,
     traj_cfg: Optional[dict] = None
 ) -> torch.Tensor:
-    original_frames = per_cam_poses[list(per_cam_poses.keys())[0]].shape[0]# 原始前视相机轨迹的时间步数
+    original_frames = per_cam_poses[list(per_cam_poses.keys())[0]].shape[0]# 原始相机轨迹的时间步数
     """
     问题: DeepAccident 使用左手系(improper rotation, det=-1),
     而 Slerp 只在 SO(3) 空间(proper rotation, det=+1)上工作。
 
-    解决方案: 逆变换 -> 插值 -> 重新组合
-    1. 逆变换: 将 DeepAccident 的相机轨迹从opencv坐标系变换到数据集坐标系
+    解决方案: 变换 -> 插值 -> 重新组合
+    1. 变换: 将相机轨迹从opencv坐标系变换到数据集坐标系
     2. 插值: 在纯旋转空间中进行 Slerp
     3. 变换: 重新应用坐标系变换, 将相机轨迹从数据集坐标系变换回opencv坐标系 
     """
-    # ========== 【新增】获取坐标系转换矩阵 ==========
+    # ========== 【新增】获取opencv相机->数据集相机的转换矩阵 ==========
     da_opencv2dataset = None
     if dataset_type == "deepaccident":
         from datasets.deepaccident.deepaccident_sourceloader import OPENCV2DATASET as DA_OPENCV2DATASET
         da_opencv2dataset = torch.from_numpy(DA_OPENCV2DATASET).float()
-        logger.info("Detected DeepAccident dataset, applying coordinate system correction for trajectory interpolation")
+        logger.info("Detected DeepAccident dataset, applying coordinate system correction for trajectory generation")
 
-    # ========== 【新增】如果有坐标系变换，进行逆变换 ==========
+    # ========== 【新增】如果有坐标系变换，进行轨迹变换 ==========
     if da_opencv2dataset is not None:
         da_dataset2opencv = torch.linalg.inv(da_opencv2dataset)
         per_cam_poses_dataset = {}
         for cam_id, poses in per_cam_poses.items():
-            per_cam_poses_dataset[cam_id] = poses @ da_dataset2opencv# 将opencv相机轨迹变回da相机轨迹
+            per_cam_poses_dataset[cam_id] = poses @ da_dataset2opencv.to(poses)# 从右往左看，将opencv相机轨迹转换成da相机轨迹
         logger.info(f"Applied inverse coordinate transformation to camera poses for {dataset_type}")
     else:
         per_cam_poses_dataset = per_cam_poses
 
     trajectory_generators = {
+        "front_center_left_2m": front_center_left_2m,
+        "front_center_left_3m": front_center_left_3m,
         "front_center_interp": front_center_interp,# 前视内插：在前视相机轨迹上选取关键帧位姿，在关键帧位姿之间插入新的时间帧位姿，共同组成新轨迹
         "s_curve": s_curve,# S形轨迹：在前视、前左、前右相机轨迹上选取关键帧位姿，在关键帧位姿之间插入新的时间帧位姿，共同组成S形轨迹
         "three_key_poses": three_key_poses_trajectory,# 弧形轨迹：选取前视首帧、前视与前左或前右插值、前视结束帧作为关键帧位姿，在关键帧位姿之间插入新的时间帧位姿，共同组成弧形轨迹
-        #"lane_change": front_center_interp,# 变道轨迹：复用前视内插作为基准轨迹，之后在opencv约定下施加横向平移
     }# 新相机轨迹生成器字典，键为轨迹类型，值为对应的生成函数
 
     if traj_type not in trajectory_generators:
         raise ValueError(f"Unknown trajectory type: {traj_type}")
 
-    # ========== 【新增】在数据集相机位姿下进行插值 ==========
-    interp_traj_dataset = trajectory_generators[traj_type](dataset_type, per_cam_poses_dataset, original_frames, target_frames)
+    # 在数据集相机坐标约定下调用生成器，得到新轨迹
+    traj_dataset = trajectory_generators[traj_type](dataset_type, per_cam_poses_dataset, original_frames, target_frames)
 
     # ========== 【新增】如果有坐标系变换，变换回去 ==========
     if da_opencv2dataset is not None:
-        interp_traj = interp_traj_dataset @ da_opencv2dataset
-        logger.info(f"Applied coordinate transformation back to interpolated trajectory for {dataset_type}")
+        traj = traj_dataset @ da_opencv2dataset.to(traj_dataset)# 将da相机新轨迹变回opencv相机新轨迹
+        logger.info(f"Applied coordinate transformation back to generated trajectory for {dataset_type}")
     else:
-        interp_traj = interp_traj_dataset
+        traj = traj_dataset
 
-    # ========== 【新增】变道横向平移 ==========
-    # 必须放在坐标系变换回opencv约定之后：
-    # 1. 此时traj[:, :3, 0]统一是"图像右"方向，不随数据集改变
-    # 2. P @ M (M为纯旋转、平移列为0) 不改变平移列，所以放在变换后不会被破坏
-    # if traj_type == "lane_change":
-    #     interp_traj = apply_lane_change_offset(interp_traj, **(traj_cfg or {}))
-    #     logger.info(f"Applied lane change offset to interpolated trajectory: {traj_cfg or 'default'}")
+    return traj
 
-    return interp_traj
+def front_center_left_2m(
+    dataset_type: str,
+    per_cam_poses: Dict[int, torch.Tensor],
+    original_frames: int,
+    target_frames: int,
+) -> torch.Tensor:
+    """将原始前中相机逐帧向自身左侧平移 2 米，不进行插值。
+
+    输入采用 DeepAccident 相机坐标约定：x 向前、y 向右、z 向上。
+    保留原始帧数和朝向。original_frames、target_frames 用于兼容
+    统一的生成器接口，不用于重采样。
+    """
+    if dataset_type != "deepaccident":
+        raise ValueError(
+            "front_center_left_2m requires DeepAccident camera coordinates"
+        )
+    if 0 not in per_cam_poses:
+        raise ValueError(
+            "Front center camera (ID 0) is required for front_center_left_2m"
+        )
+
+    base_traj = per_cam_poses[0]
+    shifted_traj = base_traj.clone()
+
+    # 相机局部 +Y 是右方向，第二列是该方向在世界坐标系中的表示。
+    right_world = base_traj[:, :3, 1]
+    shifted_traj[:, :3, 3] -= 2.0 * right_world
+
+    if target_frames != base_traj.shape[0]:
+        logger.info(
+            "front_center_left_2m preserves %d original frames; "
+            "target_frames=%d is not applied",
+            base_traj.shape[0],
+            target_frames,
+        )
+
+    return shifted_traj
+
+def front_center_left_3m(
+    dataset_type: str,
+    per_cam_poses: Dict[int, torch.Tensor],
+    original_frames: int,
+    target_frames: int,
+) -> torch.Tensor:
+    """将原始前中相机逐帧向自身左侧平移 3 米，不进行插值。
+
+    输入采用 DeepAccident 相机坐标约定：x 向前、y 向右、z 向上。
+    保留原始帧数和朝向。original_frames、target_frames 用于兼容
+    统一的生成器接口，不用于重采样。
+    """
+    if dataset_type != "deepaccident":
+        raise ValueError(
+            "front_center_left_2m requires DeepAccident camera coordinates"
+        )
+    if 0 not in per_cam_poses:
+        raise ValueError(
+            "Front center camera (ID 0) is required for front_center_left_2m"
+        )
+
+    base_traj = per_cam_poses[0]
+    shifted_traj = base_traj.clone()
+
+    # 相机局部 +Y 是右方向，第二列是该方向在世界坐标系中的表示。
+    right_world = base_traj[:, :3, 1]
+    shifted_traj[:, :3, 3] -= 3.0 * right_world
+
+    if target_frames != base_traj.shape[0]:
+        logger.info(
+            "front_center_left_2m preserves %d original frames; "
+            "target_frames=%d is not applied",
+            base_traj.shape[0],
+            target_frames,
+        )
+
+    return shifted_traj
+
+
+
 # 前视内插
 def front_center_interp(
     dataset_type: str, per_cam_poses: Dict[int, torch.Tensor], original_frames: int, target_frames: int, num_loops: int = 1
@@ -132,67 +204,7 @@ def front_center_interp(
     if key_poses[-1] is not per_cam_poses[0][-1]:# 包含最后一帧：如果关键帧位姿不包含最后一帧，将最后一帧的位姿加入关键帧位姿
         key_poses = torch.cat([key_poses, per_cam_poses[0][-1:]], dim=0)
     return interpolate_poses(key_poses, target_frames)
-# 变道横向偏移：在opencv约定的相机轨迹上施加横向平移，保持原朝向
-# def apply_lane_change_offset(
-#     traj: torch.Tensor,
-#     direction: str = "left",
-#     lane_width: float = 3.5,
-#     start_ratio: float = 0.0,
-#     end_ratio: float = 0.5,
-# ) -> torch.Tensor:
-#     """
-#     Apply a lateral (lane-change) offset to a camera trajectory, keeping the original orientation.
 
-#     The input trajectory must be in the OpenCV camera convention (x right, y down, z front),
-#     so that traj[:, :3, 0] is the world-space direction of "image right" and
-#     -traj[:, :3, 1] is the world-space direction of "image up".
-
-#     Args:
-#         traj (torch.Tensor): Camera-to-world poses of shape (N, 4, 4), OpenCV convention.
-#         direction (str): "left" or "right" - which way the ego vehicle changes lane.
-#         lane_width (float): Lateral displacement in meters.
-#         start_ratio (float): Normalized time at which the lane change begins.
-#         end_ratio (float): Normalized time at which the lane change completes.
-
-#     Returns:
-#         torch.Tensor: Offset poses of shape (N, 4, 4).
-#     """
-#     if direction not in ("left", "right"):
-#         raise ValueError(f"Unknown lane change direction: {direction}, expected 'left' or 'right'")
-#     if not 0.0 <= start_ratio < end_ratio <= 1.0:
-#         raise ValueError(
-#             f"Invalid lane change ratios: start_ratio={start_ratio}, end_ratio={end_ratio}, "
-#             "expected 0.0 <= start_ratio < end_ratio <= 1.0"
-#         )
-
-#     num_frames = traj.shape[0]
-
-#     # 世界系下的"图像右"和"图像上"方向
-#     right = traj[:, :3, 0]# (N, 3)
-#     up = -traj[:, :3, 1]# (N, 3)
-#     up = torch.nn.functional.normalize(up, dim=-1)
-
-#     # 去掉横轴的垂直分量再归一化，避免相机有俯仰/滚转时变道过程中被抬高或压低
-#     # 注意: 这里只用点乘投影，不用叉乘——DeepAccident的c2w是improper rotation，叉乘会得到反向结果
-#     right_h = right - (right * up).sum(dim=-1, keepdim=True) * up
-#     right_h = torch.nn.functional.normalize(right_h, dim=-1)# (N, 3) 世界系下的水平横向单位向量
-
-#     # 归一化时间，映射到变道区间[start_ratio, end_ratio]
-#     if num_frames > 1:
-#         normed_time = torch.linspace(0, 1, num_frames, device=traj.device, dtype=traj.dtype)
-#     else:
-#         normed_time = torch.ones(1, device=traj.device, dtype=traj.dtype)
-#     t = ((normed_time - start_ratio) / (end_ratio - start_ratio)).clamp(0.0, 1.0)
-
-#     # smoothstep插值，保证变道起止处横向速度为0，视觉上不突兀
-#     s = t * t * (3.0 - 2.0 * t)# (N,)
-
-#     sign = -1.0 if direction == "left" else 1.0# 向左即沿"图像右"的反方向
-#     offset = sign * lane_width * s[:, None] * right_h# (N, 3) 逐时间步的横向位移
-
-#     new_traj = traj.clone()
-#     new_traj[:, :3, 3] = new_traj[:, :3, 3] + offset# 只改平移，旋转保持原朝向
-#     return new_traj
 # S型内插
 def s_curve(
     dataset_type: str, per_cam_poses: Dict[int, torch.Tensor], original_frames: int, target_frames: int

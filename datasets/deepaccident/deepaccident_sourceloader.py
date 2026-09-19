@@ -72,7 +72,7 @@ class DeepAccidentCameraData(CameraData):
             cy * self.load_size[0] / self.original_size[0],
         )
         _intrinsics = np.array([[fx, 0, cx], [0, -fy, cy], [0, 0, 1]])
-        # load camera extrinsics
+        # load camera extrinsics da相机->自车变换矩阵
         cam_to_ego = np.loadtxt(
             os.path.join(self.data_path, "extrinsics", f"{self.cam_id}.txt")
         )
@@ -81,7 +81,7 @@ class DeepAccidentCameraData(CameraData):
         # system to deepaccident coordinate system.
         # opencv coordinate system: x right, y down, z front
         # deepaccident coordinate system: x front, y right, z up
-        cam_to_ego = cam_to_ego @ OPENCV2DATASET
+        cam_to_ego = cam_to_ego @ OPENCV2DATASET # opencv相机->自车变换矩阵
 
         # compute per-image poses and intrinsics
         cam_to_worlds, ego_to_worlds = [], []# ego2worlds-每一帧车辆坐标系->新世界坐标系(首帧车辆坐标系)的变换矩阵；cam2worlds-每一帧相机坐标系->新世界坐标系(首帧车辆坐标系)的变换矩阵
