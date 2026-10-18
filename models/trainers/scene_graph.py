@@ -93,19 +93,19 @@ class MultiTrainer(BasicTrainer):
             rigidnode_pts_dict = dataset.get_init_objects(
                 cur_node_type='RigidNodes',
                 **self.model_config["RigidNodes"]["init"]
-            ) # 获得刚性节点的动态实例字典：实例节点类型、所有时间帧实例坐标系下实例点云坐标、所有时间帧实例框内部点云颜色、所有时间帧实例位姿、实例长宽高、实例在所有时间帧是否存在
+            ) # 刚性节点初始化，获得刚性节点的动态实例字典：实例节点类型、所有时间帧实例坐标系下实例点云坐标、所有时间帧实例框内部点云颜色、所有时间帧实例位姿、实例长宽高、实例在所有时间帧是否存在
 
         if "DeformableNodes" in self.model_config:
             deformnode_pts_dict = dataset.get_init_objects(
                 cur_node_type='DeformableNodes',
                 exclude_smpl="SMPLNodes" in self.model_config,
                 **self.model_config["DeformableNodes"]["init"]
-            )# 获得可形变节点的动态实例字典：键同上
+            )# 可形变节点初始化，获得可形变节点的动态实例字典：键同上
 
         if "SMPLNodes" in self.model_config:
             smplnode_pts_dict = dataset.get_init_smpl_objects(
                 **self.model_config["SMPLNodes"]["init"]
-            )# 获得smpl节点的动态实例字典：实例节点类型、实例姿态、实例位置、实例体型参数、实例长宽高、实例所在时间帧、实例点云坐标、实例点云颜色
+            )# smpl节点初始化，获得smpl节点的动态实例字典：实例节点类型、实例姿态、实例位置、实例体型参数、实例长宽高、实例所在时间帧、实例点云坐标、实例点云颜色
         allnode_pts_dict = {**rigidnode_pts_dict, **deformnode_pts_dict, **smplnode_pts_dict}# 刚性节点、可形变节点、smpl节点的动态实例字典
 
         # NOTE: Some gaussian classes may be empty (because no points for initialization)
@@ -118,7 +118,7 @@ class MultiTrainer(BasicTrainer):
             model = self.models[class_name]
 
             empty = False
-            if class_name == 'Background':
+            if class_name == 'Background':# 所有时间帧范围，因为背景不随时间变化
                 # ------ initialize gaussians ------
                 init_cfg = model_cfg.pop('init')
                 # sample points from the lidar point clouds
@@ -155,7 +155,7 @@ class MultiTrainer(BasicTrainer):
                     seed_pts=sampled_pts,
                     seed_colors=sampled_color,
                     valid_instances_dict=allnode_pts_dict
-                )# 过滤实例框内部的采样点，得到背景采样点坐标、颜色
+                )# 逐帧逐动态节点排除实例框中的点，得到背景采样点坐标、颜色
 
                 model.create_from_pcd(
                     init_means=processed_init_pts["pts"], init_colors=processed_init_pts["colors"]
@@ -265,6 +265,7 @@ class MultiTrainer(BasicTrainer):
                 for class_name in self.gaussian_classes.keys():
                     gaussian_mask = self.pts_labels == self.gaussian_classes[class_name]
                     sep_rgb, sep_depth, sep_opacity = render_fn(gaussian_mask)
+                    
                     outputs[class_name+"_rgb"] = self.affine_transformation(sep_rgb, image_infos)
                     outputs[class_name+"_opacity"] = sep_opacity
                     outputs[class_name+"_depth"] = sep_depth

@@ -112,7 +112,7 @@ class DeformableNodes(RigidNodes):
             "local_xyz_deformed": means[filter_mask] if delta_xyz is not None else None,
         }
         return gs_dict
-
+    # 可形变节点高斯的正则化
     def compute_reg_loss(self):
         loss_dict = super().compute_reg_loss()
         out_of_bound_losscfg = self.reg_cfg.get("out_of_bound_loss", None)

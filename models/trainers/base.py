@@ -361,11 +361,7 @@ class BasicTrainer(nn.Module):
             gs = self.models[class_name].get_gaussians(cam)# 获取当前相机位姿下当前类别高斯属性(中心点坐标、尺度、朝向、颜色和不透明度)
             if gs is None:
                 continue
-            # 调试：平均不透明度
-            # print(f"Mean opacities: {gs['_opacities'].mean()}") 
-            # 最小最大不透明度
-            # print(f"Min/Max opacities: {gs['_opacities'].min()}, {gs['_opacities'].max()}")
-            # collect gaussians
+           
             gs["class_labels"] = torch.full((gs["_means"].shape[0],), self.gaussian_classes[class_name], device=self.device)
             for k, _ in gs.items():
                 gs_dict[k].append(gs[k])
@@ -533,21 +529,21 @@ class BasicTrainer(nn.Module):
         # calculate loss
         loss_dict = {}
         
-        if "egocar_masks" in image_infos:
+        if "egocar_masks" in image_infos:# 如果存在车体，要mask掉车体
             # in the case of egocar, we need to mask out the egocar region
-            valid_loss_mask = (1.0 - image_infos["egocar_masks"]).float()
-        else:
+            valid_loss_mask = (1.0 - image_infos["egocar_masks"]).float()# 车体位置为0，其他位置为1
+        else:# 不存在车体，创建全1mask
             valid_loss_mask = torch.ones_like(image_infos["sky_masks"])
             
-        gt_rgb = image_infos["pixels"] * valid_loss_mask[..., None]
-        predicted_rgb = outputs["rgb"] * valid_loss_mask[..., None]
+        gt_rgb = image_infos["pixels"] * valid_loss_mask[..., None]# gt图像
+        predicted_rgb = outputs["rgb"] * valid_loss_mask[..., None]# 渲染图像
         
-        gt_occupied_mask = (1.0 - image_infos["sky_masks"]).float() * valid_loss_mask
-        pred_occupied_mask = outputs["opacity"].squeeze() * valid_loss_mask
+        gt_occupied_mask = (1.0 - image_infos["sky_masks"]).float() * valid_loss_mask# gt非天空mask
+        pred_occupied_mask = outputs["opacity"].squeeze() * valid_loss_mask# 渲染图像非天空mask
         
         # rgb loss
-        Ll1 = torch.abs(gt_rgb - predicted_rgb).mean()
-        simloss = 1 - self.ssim(gt_rgb.permute(2, 0, 1)[None, ...], predicted_rgb.permute(2, 0, 1)[None, ...])
+        Ll1 = torch.abs(gt_rgb - predicted_rgb).mean()# l1损失
+        simloss = 1 - self.ssim(gt_rgb.permute(2, 0, 1)[None, ...], predicted_rgb.permute(2, 0, 1)[None, ...])# 结构相似性损失
         loss_dict.update({
             "rgb_loss": self.losses_dict.rgb.w * Ll1,
             "ssim_loss": self.losses_dict.ssim.w * simloss,
@@ -730,7 +726,7 @@ class BasicTrainer(nn.Module):
             server=self.server,
             render_fn=self._viewer_render_fn,
             num_frames=self.num_timesteps,
-            mode="training",
+            mode="rendering",
         )# viser客户端：为相机更新和时间步更新事件分别绑定回调函数，当相机或时间步或同时更新时，利用_viewer_render_fn渲染当前相机位姿、内参、图像分辨率和时间步的rgb图像
 
     @torch.no_grad()

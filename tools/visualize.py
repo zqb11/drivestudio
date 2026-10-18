@@ -71,7 +71,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Train Gaussian Splatting for a single scene")   
     
-    parser.add_argument("--resume_from", default="work_dirs/omnire/deepaccident_mini_0_6cams_20260622/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
+    parser.add_argument("--resume_from", default="work_dirs/omnire/deepaccident_mini_2_6cams_20260623/checkpoint_20000.pth", help="path to checkpoint to resume from", type=str)
     # viewer
     parser.add_argument("--enable_viewer", action="store_true", help="enable viewer")
     parser.add_argument("--viewer_port", type=int, default=1024, help="viewer port")

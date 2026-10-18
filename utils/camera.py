@@ -96,6 +96,8 @@ def get_interp_novel_trajectories(
     trajectory_generators = {
         "front_center_left_2m": front_center_left_2m,
         "front_center_left_3m": front_center_left_3m,
+        "front_center_right_2m": front_center_right_2m,
+        "front_center_right_3m": front_center_right_3m,
         "front_center_interp": front_center_interp,# 前视内插：在前视相机轨迹上选取关键帧位姿，在关键帧位姿之间插入新的时间帧位姿，共同组成新轨迹
         "s_curve": s_curve,# S形轨迹：在前视、前左、前右相机轨迹上选取关键帧位姿，在关键帧位姿之间插入新的时间帧位姿，共同组成S形轨迹
         "three_key_poses": three_key_poses_trajectory,# 弧形轨迹：选取前视首帧、前视与前左或前右插值、前视结束帧作为关键帧位姿，在关键帧位姿之间插入新的时间帧位姿，共同组成弧形轨迹
@@ -124,13 +126,14 @@ def front_center_left_2m(
 ) -> torch.Tensor:
     """将原始前中相机逐帧向自身左侧平移 2 米，不进行插值。
 
-    输入采用 DeepAccident 相机坐标约定：x 向前、y 向右、z 向上。
+    DeepAccident 输入：x 向前、y 向右、z 向上。
+    Waymo 输入已由加载器转换为 OpenCV 相机坐标：x 向右、y 向下、z 向前。
     保留原始帧数和朝向。original_frames、target_frames 用于兼容
     统一的生成器接口，不用于重采样。
     """
-    if dataset_type != "deepaccident":
+    if dataset_type not in ("deepaccident", "waymo"):
         raise ValueError(
-            "front_center_left_2m requires DeepAccident camera coordinates"
+            "front_center_left_2m supports only DeepAccident and Waymo camera coordinates"
         )
     if 0 not in per_cam_poses:
         raise ValueError(
@@ -140,8 +143,11 @@ def front_center_left_2m(
     base_traj = per_cam_poses[0]
     shifted_traj = base_traj.clone()
 
-    # 相机局部 +Y 是右方向，第二列是该方向在世界坐标系中的表示。
-    right_world = base_traj[:, :3, 1]
+    # DeepAccident 的局部 +Y 向右；Waymo 的 OpenCV 相机局部 +X 向右。
+    if dataset_type == "deepaccident":
+        right_world = base_traj[:, :3, 1]
+    else:  # waymo
+        right_world = base_traj[:, :3, 0]
     shifted_traj[:, :3, 3] -= 2.0 * right_world
 
     if target_frames != base_traj.shape[0]:
@@ -162,29 +168,117 @@ def front_center_left_3m(
 ) -> torch.Tensor:
     """将原始前中相机逐帧向自身左侧平移 3 米，不进行插值。
 
-    输入采用 DeepAccident 相机坐标约定：x 向前、y 向右、z 向上。
+    DeepAccident 输入：x 向前、y 向右、z 向上。
+    Waymo 输入已由加载器转换为 OpenCV 相机坐标：x 向右、y 向下、z 向前。
     保留原始帧数和朝向。original_frames、target_frames 用于兼容
     统一的生成器接口，不用于重采样。
     """
-    if dataset_type != "deepaccident":
+    if dataset_type not in ("deepaccident", "waymo"):
         raise ValueError(
-            "front_center_left_2m requires DeepAccident camera coordinates"
+            "front_center_left_3m supports only DeepAccident and Waymo camera coordinates"
         )
     if 0 not in per_cam_poses:
         raise ValueError(
-            "Front center camera (ID 0) is required for front_center_left_2m"
+            "Front center camera (ID 0) is required for front_center_left_3m"
         )
 
     base_traj = per_cam_poses[0]
     shifted_traj = base_traj.clone()
 
-    # 相机局部 +Y 是右方向，第二列是该方向在世界坐标系中的表示。
-    right_world = base_traj[:, :3, 1]
+    # DeepAccident 的局部 +Y 向右；Waymo 的 OpenCV 相机局部 +X 向右。
+    if dataset_type == "deepaccident":
+        right_world = base_traj[:, :3, 1]
+    else:  # waymo
+        right_world = base_traj[:, :3, 0]
     shifted_traj[:, :3, 3] -= 3.0 * right_world
 
     if target_frames != base_traj.shape[0]:
         logger.info(
-            "front_center_left_2m preserves %d original frames; "
+            "front_center_left_3m preserves %d original frames; "
+            "target_frames=%d is not applied",
+            base_traj.shape[0],
+            target_frames,
+        )
+
+    return shifted_traj
+
+def front_center_right_2m(
+    dataset_type: str,
+    per_cam_poses: Dict[int, torch.Tensor],
+    original_frames: int,
+    target_frames: int,
+) -> torch.Tensor:
+    """将原始前中相机逐帧向自身右侧平移 2 米，不进行插值。
+
+    DeepAccident 输入：x 向前、y 向右、z 向上。
+    Waymo 输入已由加载器转换为 OpenCV 相机坐标：x 向右、y 向下、z 向前。
+    保留原始帧数和朝向。original_frames、target_frames 用于兼容
+    统一的生成器接口，不用于重采样。
+    """
+    if dataset_type not in ("deepaccident", "waymo"):
+        raise ValueError(
+            "front_center_right_2m supports only DeepAccident and Waymo camera coordinates"
+        )
+    if 0 not in per_cam_poses:
+        raise ValueError(
+            "Front center camera (ID 0) is required for front_center_right_2m"
+        )
+
+    base_traj = per_cam_poses[0]
+    shifted_traj = base_traj.clone()
+
+    # DeepAccident 的局部 +Y 向右；Waymo 的 OpenCV 相机局部 +X 向右。
+    if dataset_type == "deepaccident":
+        right_world = base_traj[:, :3, 1]
+    else:  # waymo
+        right_world = base_traj[:, :3, 0]
+    shifted_traj[:, :3, 3] += 2.0 * right_world
+
+    if target_frames != base_traj.shape[0]:
+        logger.info(
+            "front_center_right_2m preserves %d original frames; "
+            "target_frames=%d is not applied",
+            base_traj.shape[0],
+            target_frames,
+        )
+
+    return shifted_traj
+
+def front_center_right_3m(
+    dataset_type: str,
+    per_cam_poses: Dict[int, torch.Tensor],
+    original_frames: int,
+    target_frames: int,
+) -> torch.Tensor:
+    """将原始前中相机逐帧向自身右侧平移 3 米，不进行插值。
+
+    DeepAccident 输入：x 向前、y 向右、z 向上。
+    Waymo 输入已由加载器转换为 OpenCV 相机坐标：x 向右、y 向下、z 向前。
+    保留原始帧数和朝向。original_frames、target_frames 用于兼容
+    统一的生成器接口，不用于重采样。
+    """
+    if dataset_type not in ("deepaccident", "waymo"):
+        raise ValueError(
+            "front_center_right_3m supports only DeepAccident and Waymo camera coordinates"
+        )
+    if 0 not in per_cam_poses:
+        raise ValueError(
+            "Front center camera (ID 0) is required for front_center_right_3m"
+        )
+
+    base_traj = per_cam_poses[0]
+    shifted_traj = base_traj.clone()
+
+    # DeepAccident 的局部 +Y 向右；Waymo 的 OpenCV 相机局部 +X 向右。
+    if dataset_type == "deepaccident":
+        right_world = base_traj[:, :3, 1]
+    else:  # waymo
+        right_world = base_traj[:, :3, 0]
+    shifted_traj[:, :3, 3] += 3.0 * right_world
+
+    if target_frames != base_traj.shape[0]:
+        logger.info(
+            "front_center_right_3m preserves %d original frames; "
             "target_frames=%d is not applied",
             base_traj.shape[0],
             target_frames,

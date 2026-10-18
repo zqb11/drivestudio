@@ -1,4 +1,5 @@
 from typing import Literal, Dict, List, Optional, Callable
+from contextlib import ExitStack
 from tqdm import tqdm, trange
 import numpy as np
 import os
@@ -460,6 +461,119 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
     
     writer.close()
     print(f"Video saved to {save_path}")
+
+
+@torch.no_grad()
+def render_novel_layer_videos(
+    trainer,
+    render_data: list,
+    output_dir: str,
+    traj_type: str,
+    fps: int = 10,
+    depth_max: float = 80.0,
+    opacity_threshold: float = 0.05,
+) -> None:
+    """Export Background/RigidNodes RGB and depth for left/right 2 m/3 m views.
+
+    Reuse the original camera data and timestamps. Layer RGB already includes
+    alpha compositing and the trainer's affine transform; do not apply alpha
+    again or blend in the sky. Depth is expected depth (RGB+ED), visualized with
+    a fixed logarithmic scale: near is bright, far is dim, invalid is black.
+    The opacity threshold only affects depth visualization.
+    """
+    if traj_type not in {
+        "front_center_left_2m",
+        "front_center_left_3m",
+        "front_center_right_2m",
+        "front_center_right_3m",
+    }:
+        return
+    if not render_data:
+        raise ValueError("render_data is empty")
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError("fps must be finite and positive")
+    if not np.isfinite(depth_max) or depth_max <= 0:
+        raise ValueError("depth_max must be finite and positive")
+    if not 0 <= opacity_threshold <= 1:
+        raise ValueError("opacity_threshold must be in [0, 1]")
+
+    class_names = ("Background", "RigidNodes")
+    missing_classes = [
+        name for name in class_names if name not in trainer.gaussian_classes
+    ]
+    if missing_classes:
+        raise ValueError(f"Checkpoint is missing Gaussian classes: {missing_classes}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    def to_numpy(tensor):
+        return tensor.detach().float().cpu().numpy()
+
+    def rgb_to_uint8(rgb_tensor):
+        rgb = to_numpy(rgb_tensor)
+        rgb = np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0)
+        return np.round(np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    def depth_to_uint8(depth_tensor, opacity_tensor):
+        depth = to_numpy(depth_tensor)[..., 0]
+        opacity = to_numpy(opacity_tensor)[..., 0]
+        valid = (
+            np.isfinite(depth)
+            & (depth > 0)
+            & np.isfinite(opacity)
+            & (opacity >= opacity_threshold)
+        )
+        safe_depth = np.where(valid, depth, 0.0)
+        normalized = np.log1p(np.clip(safe_depth, 0.0, depth_max)) / np.log1p(depth_max)
+        gray = np.where(valid, 0.1 + 0.9 * (1.0 - normalized), 0.0)
+        gray = np.round(np.clip(gray, 0.0, 1.0) * 255.0).astype(np.uint8)
+        return np.repeat(gray[..., None], 3, axis=-1)
+
+    was_training = trainer.training
+    old_render_each_class = trainer.render_each_class
+    try:
+        trainer.set_eval()
+        trainer.render_each_class = True
+        with ExitStack() as stack:
+            writers = {}
+            for class_name in class_names:
+                for channel in ("rgb", "depth"):
+                    key = f"{class_name}_{channel}"
+                    save_path = os.path.join(output_dir, f"{traj_type}_{key}.mp4")
+                    writer = imageio.get_writer(save_path, mode="I", fps=fps)
+                    stack.callback(writer.close)
+                    writers[key] = writer
+
+            for frame_data in tqdm(render_data, desc=f"Rendering layers: {traj_type}"):
+                cam_infos = {
+                    key: value.to(trainer.device, non_blocking=True)
+                    if torch.is_tensor(value) else value
+                    for key, value in frame_data["cam_infos"].items()
+                }
+                image_infos = {
+                    key: value.to(trainer.device, non_blocking=True)
+                    if torch.is_tensor(value) else value
+                    for key, value in frame_data["image_infos"].items()
+                }
+                outputs = trainer(
+                    image_infos=image_infos,
+                    camera_infos=cam_infos,
+                    novel_view=True,
+                )
+                for class_name in class_names:
+                    rgb_frame = rgb_to_uint8(outputs[f"{class_name}_rgb"])
+                    depth_frame = depth_to_uint8(
+                        outputs[f"{class_name}_depth"],
+                        outputs[f"{class_name}_opacity"],
+                    )
+                    writers[f"{class_name}_rgb"].append_data(rgb_frame)
+                    writers[f"{class_name}_depth"].append_data(depth_frame)
+    finally:
+        trainer.render_each_class = old_render_each_class
+        if was_training:
+            trainer.set_train()
+        else:
+            trainer.set_eval()
+    logger.info(f"Saved layer videos for {traj_type} to {output_dir}")
 
 
 def save_concatenated_videos(

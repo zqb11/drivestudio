@@ -396,7 +396,7 @@ class SMPLNodes(RigidNodes):
             "_scales": activated_scales[filter_mask],
         }
         return gs_dict
-
+    # SMPL节点高斯正则化：模板偏移、邻域一致性、运动平滑等正则
     def compute_reg_loss(self):
         loss_dict = super().compute_reg_loss()
 

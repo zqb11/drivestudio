@@ -301,7 +301,7 @@ class RigidNodes(VanillaGaussians):
         dup_quats = self._quats[dup_mask]
         dup_ids = self.point_ids[dup_mask]
         return dup_means, dup_feature_dc, dup_feature_rest, dup_opacities, dup_scales, dup_quats, dup_ids
-
+    # 判断高斯中心是否在车辆框内
     def get_out_of_bound_mask(self):
         """
         This function checks if the gaussians are out of instance boxes
@@ -441,7 +441,7 @@ class RigidNodes(VanillaGaussians):
             "ids": self.point_ids[pts_mask],
         }
         return gaussian_dict
-    
+    # 继承背景节点高斯正则化，额外支持体积约束、实例平移时间平滑
     def compute_reg_loss(self) -> Dict[str, torch.Tensor]:
         loss_dict = super().compute_reg_loss()
         scaling_reg = self.reg_cfg.get("scaling_reg", None)

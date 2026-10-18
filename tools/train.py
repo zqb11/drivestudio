@@ -245,7 +245,7 @@ def main(args):
         
         # get data
         train_step_camera_downscale = trainer._get_downscale_factor()# 训练和测试评估阶段的图像降采样倍数
-        image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)# 根据随机选取的训练图像帧索引得到对应的下采样目标图像信息(包括采样光线)和相机信息，之后再重置下采样因子
+        image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)# 根据随机选取的训练图像帧索引得到对应的下采样目标图像信息(包括采样光线)和相机信息，长期覆盖多时间帧多视角，之后再重置下采样因子
         for k, v in image_infos.items():
             if isinstance(v, torch.Tensor):
                 image_infos[k] = v.cuda(non_blocking=True)

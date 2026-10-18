@@ -387,7 +387,7 @@ class VanillaGaussians(nn.Module):
         dup_scales = self._scales[dup_mask]
         dup_quats = self._quats[dup_mask]
         return dup_means, dup_feature_dc, dup_feature_rest, dup_opacities, dup_scales, dup_quats
-    # 获取当前相机位姿下高斯属性(中心点坐标、尺度、朝向、颜色和不透明度)/相机位姿与高斯属性的匹配
+    # 获取当前相机位姿下高斯属性(中心点坐标、尺度、朝向、颜色和不透明度)：相机位姿与高斯属性的匹配
     def get_gaussians(self, cam: dataclass_camera) -> Dict:
         filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)# 与高斯个数一致的全1过滤掩码
         self.filter_mask = filter_mask
@@ -407,9 +407,7 @@ class VanillaGaussians(nn.Module):
         activated_scales = self.get_scaling
         activated_rotations = self.get_quats
         activated_colors = rgbs
-        # 调试：最小最大不透明度
-        # print(f"Min/Max opacities: {activated_opacities.min()}, {activated_opacities.max()}")
-        # collect gaussians information
+        
         gs_dict = dict(
             _means=self._means[filter_mask],# 中心点坐标
             _opacities=activated_opacities[filter_mask],# 不透明度
@@ -426,7 +424,7 @@ class VanillaGaussians(nn.Module):
                 raise ValueError(f"Inf detected in gaussian {k} at step {self.step}")
                 
         return gs_dict
-    
+    # 约束背景和刚性节点高斯的自身属性
     def compute_reg_loss(self):
         loss_dict = {}
         sharp_shape_reg_cfg = self.reg_cfg.get("sharp_shape_reg", None)

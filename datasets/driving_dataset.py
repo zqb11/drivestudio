@@ -552,7 +552,8 @@ class DrivingDataset(SceneDataset):
             "colors": seed_colors,
             "time": seed_time
         }
-    # 过滤不可见的近景点和远景点，得到可见掩码：排除相机不可见点，即不在宽或高范围内或深度<=0
+    # 过滤不可见的近景点和远景点，得到可见掩码：排除相机不可见点，即投影点不在相机分辨率内或深度<=0，保留相机前方且投影点在相机分辨率内的点
+    # 缺点：不能检查遮挡、是否位于真实表面
     def check_pts_visibility(self, pts_xyz):
         # filter out the lidar points that are not visible from the camera
         pts_xyz = pts_xyz.to(self.device)# 新世界坐标系下点云坐标
@@ -666,7 +667,7 @@ class DrivingDataset(SceneDataset):
                 lidar2img = intrinsic_4x4 @ cam.cam_to_worlds[frame_idx].inverse()# 新世界到图像变换矩阵
                 lidar_points = (
                     lidar2img[:3, :3] @ lidar_points.T + lidar2img[:3, 3:4]
-                ).T # (num_pts, 3) 雷达点在新世界坐标系下
+                ).T # (num_pts, 3) 雷达点在图像的投影点
                 
                 depth = lidar_points[:, 2]# 点云深度
                 cam_points = lidar_points[:, :2] / (depth.unsqueeze(-1) + 1e-6) # (num_pts, 2) 点云的像素坐标(浮点数)

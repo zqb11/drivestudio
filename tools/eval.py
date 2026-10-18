@@ -14,7 +14,8 @@ from models.trainers import BasicTrainer
 from models.video_utils import (
     render_images,
     save_videos,
-    render_novel_views
+    render_novel_views,
+    render_novel_layer_videos,
 )
 
 logger = logging.getLogger()
@@ -170,6 +171,21 @@ def do_evaluation(
                 fps=render_novel_cfg.get("fps", cfg.render.fps)
             )# 渲染和保存新轨迹视频
             logger.info(f"Saved novel view video for trajectory type: {traj_type} to {save_path}")
+            if traj_type in {
+                "front_center_left_2m",
+                "front_center_left_3m",
+                "front_center_right_2m",
+                "front_center_right_3m",
+            }:
+                render_novel_layer_videos(
+                    trainer=trainer,
+                    render_data=render_data,
+                    output_dir=os.path.join(cfg.log_dir, "videos_eval", f"novel_{step}"),
+                    traj_type=traj_type,
+                    fps=render_novel_cfg.get("fps", cfg.render.fps),
+                    depth_max=80.0,
+                    opacity_threshold=0.05,
+                )
             
 def main(args):
     log_dir = os.path.dirname(args.resume_from)
@@ -257,7 +273,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Train Gaussian Splatting for a single scene")    
     # eval
-    parser.add_argument("--resume_from", default="work_dirs/omnire/deepaccident_mini_0_6cams_20260907/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
+    parser.add_argument("--resume_from", default="work_dirs/omnire/waymo_31_5cams_20260715/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
     parser.add_argument("--render_video_postfix", type=str, default=None, help="an optional postfix for video")    
     parser.add_argument("--save_catted_videos", type=bool, default=False, help="visualize lidar on image")
     
