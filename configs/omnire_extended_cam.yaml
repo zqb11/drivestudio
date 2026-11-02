@@ -265,9 +265,13 @@ render:
   render_test: True # whether to render test set
   render_novel: 
     traj_types:
-      - front_center_interp # type of trajectory for novel view synthesis
-      - s_curve
-      - three_key_poses
+    - front_center_left_2m
+    - front_center_left_3m
+    - front_center_right_2m
+    - front_center_right_3m
+    - front_center_interp
+    - s_curve
+    - three_key_poses
     fps: 10 # frames per second for novel view rendering
   vis_lidar: False # whether to visualize lidar points on ground truth images
   vis_sky: False # whether to include "rgb_sky" and "rgb_sky_blend" in rendered keys

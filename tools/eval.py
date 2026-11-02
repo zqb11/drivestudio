@@ -1,4 +1,5 @@
 from typing import List, Optional
+from contextlib import ExitStack
 from omegaconf import OmegaConf
 import os
 import time
@@ -6,21 +7,119 @@ import json
 import wandb
 import logging
 import argparse
+import imageio
 
 import torch
+from datasets.base.pixel_source import get_rays
 from datasets.driving_dataset import DrivingDataset
 from utils.misc import import_str
 from models.trainers import BasicTrainer
 from models.video_utils import (
     render_images,
     save_videos,
-    render_novel_views,
-    render_novel_layer_videos,
 )
 
 logger = logging.getLogger()
 logging.basicConfig(level=logging.INFO)# 日志级别设置为INFO，这样INFO、WARNING都能显示
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+
+
+@torch.no_grad()
+def render_novel_multicam_videos(
+    trainer, dataset, traj, save_path, fps, save_rgb=True, save_layers=True,
+):
+    """沿新轨迹渲染六相机 RGB 和分层绿底视频，复用数据集排版。"""
+    trainer.set_eval()
+    pixel_source = dataset.pixel_source
+    camera_ids = pixel_source.camera_list
+    if 0 not in camera_ids:
+        raise ValueError("Multi-camera novel rendering requires front camera (ID 0)")
+    device = trainer.device
+    front_pose = pixel_source.camera_data[0].cam_to_worlds[0].to(device)
+    world_to_front = torch.linalg.inv(front_pose)
+    cameras = []
+    for cam_id in camera_ids:
+        cam = pixel_source.camera_data[cam_id]
+        H, W = cam.HEIGHT, cam.WIDTH
+        x, y = torch.meshgrid(
+            torch.arange(W, device=device), torch.arange(H, device=device),
+            indexing="xy",
+        )
+        cameras.append({
+            "cam": cam,
+            "relative_pose": world_to_front @ cam.cam_to_worlds[0].to(device),
+            "x": x,
+            "y": y,
+            "pixel_coords": torch.stack([y.float() / H, x.float() / W], dim=-1),
+        })
+
+    frame_indices = torch.linspace(0, pixel_source.num_frames - 1, len(traj)).round().long()
+    normed_times = torch.linspace(0, 1, len(traj))
+    cam_names = [camera["cam"].cam_name for camera in cameras]
+    output_paths = {"rgb": save_path} if save_rgb else {}
+    if save_layers:
+        for layer in ("Background", "Dynamic", "RigidNodes", "DeformableNodes", "SMPLNodes"):
+            output_paths[layer] = save_path.removesuffix("rgbs.mp4") + f"{layer}_rgbs.mp4"
+            if layer != "Dynamic" and layer not in trainer.gaussian_classes:
+                logger.info("No %s nodes; exporting green background for %s", layer, save_path)
+    if not output_paths:
+        return
+    with ExitStack() as stack:
+        writers = {
+            name: stack.enter_context(imageio.get_writer(
+                path, mode="I", fps=fps, ffmpeg_params=["-threads", "2"],
+            ))
+            for name, path in output_paths.items()
+        }
+        for i, pose in enumerate(traj):
+            frame_idx = frame_indices[i].item()
+            frames = {name: [] for name in output_paths}
+            for camera in cameras:
+                cam = camera["cam"]
+                H, W = cam.HEIGHT, cam.WIDTH
+                c2w = pose.to(device) @ camera["relative_pose"]
+                intrinsics = cam.intrinsics[frame_idx].to(device)
+                origins, viewdirs, direction_norm = get_rays(
+                    camera["x"].flatten(), camera["y"].flatten(), c2w, intrinsics,
+                )
+                image_infos = {
+                    "origins": origins.reshape(H, W, 3),
+                    "viewdirs": viewdirs.reshape(H, W, 3),
+                    "direction_norm": direction_norm.reshape(H, W, 1),
+                    "pixel_coords": camera["pixel_coords"],
+                    "img_idx": cam.unique_img_idx[frame_idx].to(device).expand(H, W),
+                    "frame_idx": torch.tensor(frame_idx, device=device),
+                    "normed_time": normed_times[i].to(device),
+                }
+                camera_infos = {
+                    "camera_to_world": c2w,
+                    "intrinsics": intrinsics,
+                    "height": torch.tensor([H], device=device),
+                    "width": torch.tensor([W], device=device),
+                    "cam_id": torch.tensor(cam.cam_id, device=device),
+                    "cam_name": cam.cam_name,
+                }
+                outputs = trainer(image_infos, camera_infos, novel_view=True)
+                green_background = outputs["rgb"].new_tensor([0.0, 177.0, 64.0]) / 255.0
+                for name in output_paths:
+                    if name == "rgb":
+                        rgb = outputs["rgb"].clamp(0, 1)
+                    elif f"{name}_rgb" in outputs:
+                        opacity = outputs[f"{name}_opacity"]
+                        rgb = outputs[f"{name}_rgb"].clamp(0, 1)
+                        rgb = rgb + green_background * (1 - opacity)
+                    elif name not in trainer.gaussian_classes and name != "Dynamic":
+                        rgb = green_background.expand(H, W, 3)
+                    else:
+                        raise KeyError(f"Missing Gaussian layer output: {name}_rgb")
+                    frames[name].append((rgb.clamp(0, 1) * 255).to(torch.uint8).cpu().numpy())
+                del outputs
+            for name, writer in writers.items():
+                tiled_rgb = dataset.layout(frames[name], cam_names)
+                writer.append_data(tiled_rgb.astype("uint8"))
+            logger.info("Novel videos %s: frame %d/%d", save_path, i + 1, len(traj))
+
+
 # 可选：基于测试轨迹和完整轨迹渲染视频、评估指标；基于新轨迹渲染视频
 @torch.no_grad()
 def do_evaluation(
@@ -161,38 +260,31 @@ def do_evaluation(
             os.makedirs(video_output_dir)
         
         for traj_type, traj in render_traj.items():
-            # Prepare rendering data(准备新轨迹渲染的相机信息和图像信息)
-            render_data = dataset.prepare_novel_view_render_data(traj)
-            
-            # Render and save video
-            save_path = os.path.join(video_output_dir, f"{traj_type}.mp4")
-            render_novel_views(
-                trainer, render_data, save_path,
-                fps=render_novel_cfg.get("fps", cfg.render.fps)
-            )# 渲染和保存新轨迹视频
-            logger.info(f"Saved novel view video for trajectory type: {traj_type} to {save_path}")
-            if traj_type in {
-                "front_center_left_2m",
-                "front_center_left_3m",
-                "front_center_right_2m",
-                "front_center_right_3m",
-            }:
-                render_novel_layer_videos(
-                    trainer=trainer,
-                    render_data=render_data,
-                    output_dir=os.path.join(cfg.log_dir, "videos_eval", f"novel_{step}"),
-                    traj_type=traj_type,
+            trajectory_name = traj_type.removeprefix("front_center_")
+            trajectory_dir = os.path.join(video_output_dir, f"{trajectory_name}_rgbs")
+            os.makedirs(trajectory_dir, exist_ok=True)
+            save_path = os.path.join(trajectory_dir, f"{trajectory_name}_rgbs.mp4")
+            save_rgb = render_novel_cfg.get("save_rgb", True)
+            save_layers = render_novel_cfg.get("save_layers", True)
+            render_each_class = getattr(trainer, "render_each_class", False)
+            trainer.render_each_class = save_layers
+            try:
+                render_novel_multicam_videos(
+                    trainer, dataset, traj, save_path,
                     fps=render_novel_cfg.get("fps", cfg.render.fps),
-                    depth_max=80.0,
-                    opacity_threshold=0.05,
+                    save_rgb=save_rgb, save_layers=save_layers,
                 )
+            finally:
+                trainer.render_each_class = render_each_class
+            logger.info(f"Saved novel view video for trajectory type: {traj_type} to {save_path}")
             
 def main(args):
     log_dir = os.path.dirname(args.resume_from)
     cfg = OmegaConf.load(os.path.join(log_dir, "config.yaml"))
     cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(args.opts))
+    cfg.log_dir = log_dir
     args.enable_wandb = False
-    for folder in ["videos_eval", "metrics_eval"]:
+    for folder in [f"videos{args.output_postfix}", f"metrics{args.output_postfix}"]:
         os.makedirs(os.path.join(log_dir, folder), exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -233,6 +325,7 @@ def main(args):
     
     # define render keys
     render_keys = [
+        "Dynamic_rgbs",
         "gt_rgbs",
         "rgbs",
         "Background_rgbs",
@@ -263,7 +356,7 @@ def main(args):
         dataset=dataset,
         render_keys=render_keys,
         args=args,
-        post_fix="_eval"
+        post_fix=args.output_postfix
     )
     
     if args.enable_viewer:
@@ -273,8 +366,9 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Train Gaussian Splatting for a single scene")    
     # eval
-    parser.add_argument("--resume_from", default="work_dirs/omnire/waymo_31_5cams_20260715/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
+    parser.add_argument("--resume_from", default="front_center_interp,s_curve,three_key_poses", help="path to checkpoint to resume from", type=str)
     parser.add_argument("--render_video_postfix", type=str, default=None, help="an optional postfix for video")    
+    parser.add_argument("--output_postfix", type=str, default="", help="optional suffix for output folders; defaults to videos/ and metrics/")
     parser.add_argument("--save_catted_videos", type=bool, default=False, help="visualize lidar on image")
     
     # viewer

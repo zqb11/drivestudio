@@ -5,6 +5,7 @@ import numpy as np
 import os
 import logging
 import imageio
+import json
 
 import torch
 from torch import Tensor
@@ -83,6 +84,127 @@ def render_images(
         logger.info(f"\tVehicle-Only SSIM: {render_results['vehicle_ssim']:.4f}")
 
     return render_results
+
+
+def render_images_streaming(
+    trainer,
+    dataset,
+    save_pth,
+    layout,
+    num_timestamps,
+    num_cams,
+    keys,
+    save_seperate_video=True,
+    fps=10,
+    compute_metrics=True,
+    compute_error_map=False,
+    progress_path=None,
+):
+    """Render one timestamp at a time, preserving legacy videos and metrics.
+
+    Only one timestamp's camera outputs and the middle video frame are kept.
+    Metric means are weighted by their individual valid-image counts, matching
+    ``render`` even when a dynamic/human/vehicle mask is empty in some views.
+    """
+    if num_timestamps < 1 or num_cams < 1:
+        raise ValueError("num_timestamps and num_cams must be positive")
+    if len(dataset) != num_timestamps * num_cams:
+        raise ValueError("dataset length must equal num_timestamps * num_cams")
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError("fps must be finite and positive")
+
+    trainer.set_eval()
+    midpoint_frames = {}
+    sums, counts = {}, {}
+
+    def metric_means():
+        return {key: sums[key] / counts[key] if counts[key] else -1
+                for key in sums}
+
+    def video_frame(result, key):
+        source_key = key.replace("mask", "opacities") if "mask" in key else key
+        frames = result.get(source_key, [])
+        if len(frames) == 0:
+            return None
+        if key == "gt_sky_masks" or "mask" in key:
+            frames = [np.stack([frame, frame, frame], axis=-1) for frame in frames]
+        elif "depth" in key:
+            opacity_key = key.replace("depths", "opacities")
+            opacities = result.get(opacity_key)
+            if opacities is None and "median" in key:
+                opacities = result.get(key.replace("median_depths", "opacities"))
+            if opacities is None:
+                return None
+            frames = [depth_visualizer(frame, opacity)
+                      for frame, opacity in zip(frames, opacities)]
+        return layout(frames, result["cam_names"])
+
+    with ExitStack() as stack:
+        writers = {}
+        progress = None
+        if progress_path is not None:
+            progress = stack.enter_context(open(progress_path, "w"))
+
+        def writer_for(key):
+            if key not in writers:
+                if save_seperate_video:
+                    path = save_pth.replace(".mp4", f"_{key}.mp4")
+                    path = path.replace(".png", f"_{key}.png")
+                else:
+                    path = save_pth
+                writer = imageio.get_writer(
+                    path, mode="I", fps=fps, output_params=["-threads", "2"]
+                )
+                stack.callback(writer.close)
+                writers[key] = writer
+            return writers[key]
+
+        for timestep in tqdm(range(num_timestamps), desc="streaming evaluation", dynamic_ncols=True):
+            result = render(
+                dataset,
+                trainer=trainer,
+                compute_metrics=compute_metrics,
+                compute_error_map=compute_error_map,
+                vis_indices=list(range(timestep * num_cams, (timestep + 1) * num_cams)),
+            )
+            metric_counts = result.get("_metric_counts", {})
+            for key, value in result.items():
+                if not isinstance(value, (int, float, np.number)):
+                    continue
+                count = metric_counts.get(key, 0)
+                sums.setdefault(key, 0.0)
+                counts.setdefault(key, 0)
+                if count:
+                    sums[key] += value * count
+                    counts[key] += count
+
+            merged = []
+            for key in keys:
+                frame = video_frame(result, key)
+                if frame is None:
+                    continue
+                if save_seperate_video:
+                    encoded = to8b(frame)
+                    writer_for(key).append_data(encoded)
+                    if timestep == num_timestamps // 2:
+                        midpoint_frames[key] = encoded
+                else:
+                    merged.append(frame)
+            if not save_seperate_video and merged:
+                encoded = to8b(np.concatenate(merged, axis=0))
+                writer_for("concatenated_frame").append_data(encoded)
+                if timestep == num_timestamps // 2:
+                    midpoint_frames["concatenated_frame"] = encoded
+            if progress is not None:
+                progress.write(json.dumps({
+                    "t": timestep,
+                    "processed_images": (timestep + 1) * num_cams,
+                    "metrics": metric_means(),
+                    "metric_counts": counts,
+                }) + "\n")
+                progress.flush()
+            del result
+    return metric_means(), midpoint_frames
 
 
 def render(
@@ -231,11 +353,12 @@ def render(
 
             if compute_metrics:
                 psnr = compute_psnr(rgb, image_infos["pixels"])
-                ssim_score = ssim(
+                ssim_score, ssim_map = ssim(
                     get_numpy(rgb),
                     get_numpy(image_infos["pixels"]),
                     data_range=1.0,
                     channel_axis=-1,
+                    full=True,
                 )
                 lpips = trainer.lpips(
                     rgb[None, ...].permute(0, 3, 1, 2),
@@ -249,73 +372,53 @@ def render(
                 if "sky_masks" in image_infos:
                     occupied_mask = ~get_numpy(image_infos["sky_masks"]).astype(bool)
                     if occupied_mask.sum() > 0:
+                        occupied_tensor_mask = torch.as_tensor(occupied_mask, device=rgb.device, dtype=torch.bool)
                         occupied_psnrs.append(
                             compute_psnr(
-                                rgb[occupied_mask], image_infos["pixels"][occupied_mask]
+                                rgb[occupied_tensor_mask], image_infos["pixels"][occupied_tensor_mask]
                             )
                         )
                         occupied_ssims.append(
-                            ssim(
-                                get_numpy(rgb),
-                                get_numpy(image_infos["pixels"]),
-                                data_range=1.0,
-                                channel_axis=-1,
-                                full=True,
-                            )[1][occupied_mask].mean()
+                            ssim_map[occupied_mask].mean()
                         )
 
                 if "dynamic_masks" in image_infos:
                     dynamic_mask = get_numpy(image_infos["dynamic_masks"]).astype(bool)
                     if dynamic_mask.sum() > 0:
+                        dynamic_tensor_mask = torch.as_tensor(dynamic_mask, device=rgb.device, dtype=torch.bool)
                         masked_psnrs.append(
                             compute_psnr(
-                                rgb[dynamic_mask], image_infos["pixels"][dynamic_mask]
+                                rgb[dynamic_tensor_mask], image_infos["pixels"][dynamic_tensor_mask]
                             )
                         )
                         masked_ssims.append(
-                            ssim(
-                                get_numpy(rgb),
-                                get_numpy(image_infos["pixels"]),
-                                data_range=1.0,
-                                channel_axis=-1,
-                                full=True,
-                            )[1][dynamic_mask].mean()
+                            ssim_map[dynamic_mask].mean()
                         )
                 
                 if "human_masks" in image_infos:
                     human_mask = get_numpy(image_infos["human_masks"]).astype(bool)
                     if human_mask.sum() > 0:
+                        human_tensor_mask = torch.as_tensor(human_mask, device=rgb.device, dtype=torch.bool)
                         human_psnrs.append(
                             compute_psnr(
-                                rgb[human_mask], image_infos["pixels"][human_mask]
+                                rgb[human_tensor_mask], image_infos["pixels"][human_tensor_mask]
                             )
                         )
                         human_ssims.append(
-                            ssim(
-                                get_numpy(rgb),
-                                get_numpy(image_infos["pixels"]),
-                                data_range=1.0,
-                                channel_axis=-1,
-                                full=True,
-                            )[1][human_mask].mean()
+                            ssim_map[human_mask].mean()
                         )
                 
                 if "vehicle_masks" in image_infos:
                     vehicle_mask = get_numpy(image_infos["vehicle_masks"]).astype(bool)
                     if vehicle_mask.sum() > 0:
+                        vehicle_tensor_mask = torch.as_tensor(vehicle_mask, device=rgb.device, dtype=torch.bool)
                         vehicle_psnrs.append(
                             compute_psnr(
-                                rgb[vehicle_mask], image_infos["pixels"][vehicle_mask]
+                                rgb[vehicle_tensor_mask], image_infos["pixels"][vehicle_tensor_mask]
                             )
                         )
                         vehicle_ssims.append(
-                            ssim(
-                                get_numpy(rgb),
-                                get_numpy(image_infos["pixels"]),
-                                data_range=1.0,
-                                channel_axis=-1,
-                                full=True,
-                            )[1][vehicle_mask].mean()
+                            ssim_map[vehicle_mask].mean()
                         )
 
     # messy aggregation...
@@ -331,6 +434,13 @@ def render(
     results_dict["human_ssim"] = non_zero_mean(human_ssims) if compute_metrics else -1
     results_dict["vehicle_psnr"] = non_zero_mean(vehicle_psnrs) if compute_metrics else -1
     results_dict["vehicle_ssim"] = non_zero_mean(vehicle_ssims) if compute_metrics else -1
+    results_dict["_metric_counts"] = {
+        "psnr": len(psnrs), "ssim": len(ssim_scores), "lpips": len(lpipss),
+        "occupied_psnr": len(occupied_psnrs), "occupied_ssim": len(occupied_ssims),
+        "masked_psnr": len(masked_psnrs), "masked_ssim": len(masked_ssims),
+        "human_psnr": len(human_psnrs), "human_ssim": len(human_ssims),
+        "vehicle_psnr": len(vehicle_psnrs), "vehicle_ssim": len(vehicle_ssims),
+    } if compute_metrics else {}
     results_dict["rgbs"] = rgbs
     results_dict["depths"] = depths
     results_dict["cam_names"] = cam_names
@@ -475,9 +585,9 @@ def render_novel_layer_videos(
 ) -> None:
     """Export Background/RigidNodes RGB and depth for left/right 2 m/3 m views.
 
-    Reuse the original camera data and timestamps. Layer RGB already includes
-    alpha compositing and the trainer's affine transform; do not apply alpha
-    again or blend in the sky. Depth is expected depth (RGB+ED), visualized with
+    Reuse the original camera data and timestamps. Match render_images by
+    blending each layer RGB over green using its opacity, without sky blending.
+    Depth is expected depth (RGB+ED), visualized with
     a fixed logarithmic scale: near is bright, far is dim, invalid is black.
     The opacity threshold only affects depth visualization.
     """
@@ -560,7 +670,13 @@ def render_novel_layer_videos(
                     novel_view=True,
                 )
                 for class_name in class_names:
-                    rgb_frame = rgb_to_uint8(outputs[f"{class_name}_rgb"])
+                    layer_rgb = outputs[f"{class_name}_rgb"].clamp(0.0, 1.0)
+                    layer_opacity = outputs[f"{class_name}_opacity"]
+                    green_background = layer_rgb.new_tensor([0.0, 177.0, 64.0]) / 255.0
+                    rgb_frame = rgb_to_uint8(
+                        layer_rgb * layer_opacity
+                        + green_background * (1.0 - layer_opacity)
+                    )
                     depth_frame = depth_to_uint8(
                         outputs[f"{class_name}_depth"],
                         outputs[f"{class_name}_opacity"],
