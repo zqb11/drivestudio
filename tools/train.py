@@ -7,6 +7,7 @@ import random
 import imageio
 import logging
 import argparse
+import json
 
 import torch
 from tools.eval import do_evaluation
@@ -105,7 +106,9 @@ def setup(args):
 
 def main(args):
     cfg = setup(args)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Gaussian training requires a CUDA GPU visible in the drivestudio environment")
+    device = torch.device("cuda")
 
     # build dataset
     dataset = DrivingDataset(data_cfg=cfg.data)
@@ -137,6 +140,13 @@ def main(args):
         logger.info(
             f"Training from scratch, initializing gaussians from dataset, starting at step {trainer.step}"
         )
+    if trainer.identity_field is not None:
+        identity = trainer.identity_field
+        mapping = identity.get_extra_state()
+        mapping["dataset_ids"] = identity.dataset_ids.tolist()
+        mapping["true_ids"] = identity.true_ids.tolist()
+        with open(os.path.join(cfg.log_dir, "identity_mapping.json"), "w") as f:
+            json.dump(mapping, f, indent=2)
     
     if args.enable_viewer:
         # a simple viewer for visualization 训练过程可视化3D视频
@@ -167,12 +177,14 @@ def main(args):
         render_keys.insert(render_keys.index("rgbs") + 1, "rgb_error_maps")
     
     # setup optimizer  
+    if trainer.step >= trainer.num_iters:
+        raise ValueError(f"Checkpoint step {trainer.step} must be less than num_iters={trainer.num_iters}")
     trainer.initialize_optimizer()
     
     # setup metric logger
     metrics_file = os.path.join(cfg.log_dir, "metrics.json")# 指标文件
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
-    all_iters = np.arange(trainer.step, trainer.num_iters + 1)# 迭代步数数组
+    all_iters = np.arange(trainer.step + 1, trainer.num_iters + 1)# 40000 iterations means 40000 updates
     
     # DEBUG USE
     # do_evaluation(
@@ -245,7 +257,7 @@ def main(args):
         
         # get data
         train_step_camera_downscale = trainer._get_downscale_factor()# 训练和测试评估阶段的图像降采样倍数
-        image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)# 根据随机选取的训练图像帧索引得到对应的下采样目标图像信息(包括采样光线)和相机信息，长期覆盖多时间帧多视角，之后再重置下采样因子
+        image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)# 根据随机选取的训练图像帧索引得到对应的下采样目标图像信息(包括采样光线)和相机信息（训练迭代覆盖多时间帧多视角），之后再重置下采样因子
         for k, v in image_infos.items():
             if isinstance(v, torch.Tensor):
                 image_infos[k] = v.cuda(non_blocking=True)
@@ -254,7 +266,7 @@ def main(args):
                 cam_infos[k] = v.cuda(non_blocking=True)
         
         # forward & backward
-        outputs = trainer(image_infos, cam_infos)# 模型基于当前图像帧的图像和相机信息前向预测高斯rgb图、高斯深度图、高斯不透明度、天空rgb图、经过高斯不透明度过滤的天空rgb图、经过外观仿射变换的完整rgb图
+        outputs = trainer(image_infos, cam_infos)# 模型基于选择的目标图像和相机信息前向预测高斯rgb图、高斯深度图、高斯不透明度、天空rgb图、经过高斯不透明度过滤的天空rgb图、经过外观仿射变换的完整rgb图
         trainer.update_visibility_filter()# 更新高斯类别的2D溅射块半径，是后续点云密化、修剪或调整学习率的几何依据
 
         loss_dict = trainer.compute_losses(
@@ -262,6 +274,15 @@ def main(args):
             image_infos=image_infos,
             cam_infos=cam_infos,
         )# 计算损失
+        if trainer.identity_field is not None and step <= 6:
+            labels = outputs["id_labels"].detach().cpu().numpy()
+            palette = np.random.RandomState(0).randint(32, 256, (trainer.identity_field.num_classes, 3), dtype=np.uint8)
+            palette[0] = 0
+            preview = palette[labels.clip(min=0)]
+            preview[labels < 0] = 127
+            gt = (image_infos["pixels"].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            imageio.imwrite(os.path.join(cfg.log_dir, "images", f"id_labels_{step:05d}.png"),
+                            np.concatenate([gt, preview], axis=1))
         # check nan or inf
         for k, v in loss_dict.items():
             if torch.isnan(v).any():
@@ -284,6 +305,7 @@ def main(args):
         metric_logger.update(**{"train_metrics/"+k: v.item() for k, v in metric_dict.items()})
         metric_logger.update(**{"train_stats/gaussian_num_" + k: v for k, v in trainer.get_gaussian_count().items()})
         metric_logger.update(**{"losses/"+k: v.item() for k, v in loss_dict.items()})
+        metric_logger.update(**{"identity/"+k: v for k, v in trainer.identity_stats.items()})
         metric_logger.update(**{"train_stats/lr_" + group['name']: group['lr'] for group in trainer.optimizer.param_groups})
         if args.enable_wandb:# 日志上传wandb云端
             wandb.log({k: v.avg for k, v in metric_logger.meters.items()})
@@ -292,7 +314,8 @@ def main(args):
         #----------------------------     Saving     --------------------------------
         do_save = step > 0 and (
             (step % cfg.logging.saveckpt_freq == 0) or (step == trainer.num_iters)
-        ) and (args.resume_from is None)
+            or step in cfg.logging.get("saveckpt_steps", [])
+        )
         if do_save:  
             trainer.save_checkpoint(
                 log_dir=cfg.log_dir,
@@ -356,7 +379,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_root", default="./work_dirs/", help="path to save checkpoints and logs", type=str)
     
     # eval
-    parser.add_argument("--resume_from", default="work_dirs/omnire/deepaccident_mini_0_6cams_20260907/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
+    parser.add_argument("--resume_from", default=None, help="path to checkpoint to resume from; default trains from scratch", type=str)
     #parser.add_argument("--resume_from", default=None, help="path to checkpoint to resume from", type=str)
     parser.add_argument("--render_video_postfix", type=str, default=None, help="an optional postfix for video")    
     
@@ -364,7 +387,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable_wandb", action="store_true", help="enable wandb logging")
     parser.add_argument("--entity", default="qiangbzhang-university-of-science-and-technology-of-china", type=str, help="wandb entity name")
     parser.add_argument("--project", default="omnire", type=str, help="wandb project name, also used to enhance log_dir")
-    parser.add_argument("--run_name", default="deepaccident_mini_0_6cams_20260907", type=str, help="wandb run name, also used to enhance log_dir")
+    parser.add_argument("--run_name", default="deepaccident_mini/000", type=str, help="wandb run name, also used to enhance log_dir")
     #parser.add_argument("--run_name", default="waymo_31_5cams_20260715", type=str, help="wandb run name, also used to enhance log_dir")
     # viewer
     parser.add_argument("--enable_viewer", action="store_true", help="enable viewer")

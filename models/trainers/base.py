@@ -70,6 +70,7 @@ class BasicTrainer(nn.Module):
         res_schedule: OmegaConf = None,
         gaussian_optim_general_cfg: OmegaConf = None,
         gaussian_ctrl_general_cfg: OmegaConf = None,
+        identity: OmegaConf = None,
         model_config: OmegaConf = None,
         num_train_images: int = 0,
         num_full_images: int = 0,
@@ -89,6 +90,9 @@ class BasicTrainer(nn.Module):
         self.num_iters = self.optim_general.get("num_iters", 30000)
         self.gaussian_optim_general_cfg = gaussian_optim_general_cfg
         self.gaussian_ctrl_general_cfg = gaussian_ctrl_general_cfg
+        self.identity_cfg = identity
+        self.identity_field = None
+        self.identity_stats = {}
         self.step = 0
         self.device = device
         #self.camera_data = camera_data# 相机信息
@@ -227,7 +231,13 @@ class BasicTrainer(nn.Module):
                 # adjust max_steps to account for opt_after
                 sched_cfg.max_steps = sched_cfg.max_steps - sched_cfg.opt_after
                 lr_schedulers[params_name] = lr_scheduler_fn(sched_cfg, lr_init)
-
+        # add identity classifier parameters to optimizer
+        if self.identity_field is not None:
+            groups.append({
+                "params": list(self.identity_field.classifier.parameters()),
+                "name": "Identity#classifier",
+                "lr": self.identity_cfg.get("classifier_lr", 0.001),
+            })
         self.optimizer = torch.optim.Adam(groups, lr=0.0, eps=1e-15)
         self.lr_schedulers = lr_schedulers
         self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.optim_general.get("use_grad_scaler", False))
@@ -357,10 +367,15 @@ class BasicTrainer(nn.Module):
             "_opacities": [],
             "class_labels": [],
         }# 当前相机位姿下所有高斯属性
+        id_features, instance_ids = [], []
         for class_name in self.gaussian_classes.keys():# 遍历高斯类
             gs = self.models[class_name].get_gaussians(cam)# 获取当前相机位姿下当前类别高斯属性(中心点坐标、尺度、朝向、颜色和不透明度)
             if gs is None:
                 continue
+            if self.identity_field is not None:
+                model = self.models[class_name]
+                id_features.append(model._id_features[model.filter_mask])# 这个类别高斯的归属id特征
+                instance_ids.append(self.identity_field.point_labels(class_name, model)[model.filter_mask])# 这个类别高斯的归属id
            
             gs["class_labels"] = torch.full((gs["_means"].shape[0],), self.gaussian_classes[class_name], device=self.device)
             for k, _ in gs.items():
@@ -381,7 +396,8 @@ class BasicTrainer(nn.Module):
             _rgbs=gs_dict["_rgbs"],
             _opacities=gs_dict["_opacities"],
             detach_keys=[],    # if "means" in detach_keys, then the means will be detached
-            extras=None        # to save some extra information (TODO) more flexible way
+            extras={"id_features": torch.cat(id_features), "instance_ids": torch.cat(instance_ids)}# 所有高斯的归属id特征和归属id
+                if self.identity_field is not None else None
         )# 当前图像帧相机位姿下所有高斯属性：有_是原始属性，无_是根据detach_keys决定的冻结或不冻结属性
         
         return gaussians
@@ -423,7 +439,7 @@ class BasicTrainer(nn.Module):
                 return torch.clamp(rendered_rgb, max=1.0), rendered_depth, alphas[..., None], info
         
         # render rgb and opacity
-        rgb, depth, opacity, self.info = render_fn(return_info=True)# 高斯溅射和光栅化渲染，得到rgb图、预测深度图(初始化的高斯z用不透明度阿发合成)、不透明度图、元数据
+        rgb, depth, opacity, self.info = render_fn(return_info=True)# 高斯溅射和光栅化渲染，得到rgb图、预测深度图(初始化的高斯z用不透明度阿发合成)、累计不透明度图、元数据
         
         results = {
             "rgb_gaussians": rgb,
@@ -433,6 +449,22 @@ class BasicTrainer(nn.Module):
         
         if self.training:
             self.info["means2d"].retain_grad()
+            if self.identity_field is not None:
+                # A separate feature pass preserves RGB means2d/absgrad for densification.
+                feature_kwargs = dict(kwargs)
+                feature_kwargs["render_mode"] = "RGB"
+                features, feature_alpha, _ = rasterization(
+                    means=gs.means, quats=gs.quats, scales=gs.scales,
+                    opacities=gs.opacities.reshape(-1), colors=gs.extras["id_features"],
+                    viewmats=torch.linalg.inv(cam.camtoworlds)[None], Ks=cam.Ks[None],
+                    width=cam.W, height=cam.H, packed=self.render_cfg.packed,
+                    absgrad=False, sparse_grad=self.render_cfg.sparse_grad,
+                    rasterize_mode="antialiased" if self.render_cfg.antialiased else "classic",
+                    **feature_kwargs,
+                )
+                results["id_features"] = features[0] / feature_alpha[0].clamp_min(1e-6)# 高斯不透明度权重归一化，得到加权平均的id特征图，降低每个高斯的不透明度权重，进而降低像素被高斯覆盖了多少对id学习的影响，使得根据id特征学习id更容易
+                results["id_gaussians"] = gs# 目标图像时间帧的高斯属性
+                results["id_camera"] = cam# 目标图像相机信息
         
         return results, render_fn
     # 渲染图像外观仿射变换
@@ -656,6 +688,12 @@ class BasicTrainer(nn.Module):
         return state_dict
 
     def load_state_dict(self, state_dict: dict, load_only_model: bool =True, strict: bool = True):
+        if (self.identity_cfg is not None and self.identity_cfg.get("enabled", False)
+                and "identity_field._extra_state" not in state_dict):
+            raise ValueError("ID training requires a fresh initialization or an ID checkpoint with instance mapping")
+        if "identity_field._extra_state" in state_dict:
+            from models.identity import IdentityField
+            self.identity_field = IdentityField.from_checkpoint(state_dict).to(self.device)
         step = state_dict.pop("step")
         self.step = step
         logger.info(f"Loading checkpoint at step {step}")

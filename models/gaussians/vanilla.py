@@ -52,6 +52,7 @@ class VanillaGaussians(nn.Module):
         self.device = device
         self.ball_gaussians = self.ctrl_cfg.get("ball_gaussians", False)
         self.gaussian_2d = self.ctrl_cfg.get("gaussian_2d", False)
+        self.id_embedding_dim = int(self.ctrl_cfg.get("id_embedding_dim", 0))# 8维
         
         # for evaluation
         self.in_test_set = False
@@ -72,6 +73,13 @@ class VanillaGaussians(nn.Module):
         # 球谐系数
         self._features_dc = torch.zeros(1, 3, device=self.device)# 全0初始化0阶SH系数
         self._features_rest = torch.zeros(1, num_sh_bases(self.sh_degree) - 1, 3, device=self.device)# 全0初始化高阶SH系数：(1, 除去0阶的SH系数个数, 3)
+        self.initialize_id_features()# 随机初始化高斯归属id特征，背景、刚性、smpl、可形变都调用
+
+    def initialize_id_features(self) -> None:
+        if self.id_embedding_dim > 0:
+            self._id_features = Parameter(
+                torch.randn(self.num_points, self.id_embedding_dim, device=self._means.device, dtype=self._means.dtype) * 0.01
+            )# 随机初始化的高斯归属id特征
         
     @property
     def sh_degree(self):
@@ -114,6 +122,7 @@ class VanillaGaussians(nn.Module):
         self._features_rest = Parameter(shs[:, 1:, :])# 高阶SH参数
         # Initialize opacity to 0.1 (logit space: -2.1972) for all points, NOT 0
         self._opacities = Parameter(torch.logit(torch.full((self.num_points, 1), 0.1, device=self.device), eps=1e-7))# 用0.1初始化不透明度
+        self.initialize_id_features()
 
         logger.info(f"[{self.class_prefix.rstrip('#')}] Successfully initialized {self.num_points} Gaussians with opacity init value 0.1")
         
@@ -204,7 +213,7 @@ class VanillaGaussians(nn.Module):
             )
         
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
-        return {
+        param_groups = {
             self.class_prefix+"xyz": [self._means],
             self.class_prefix+"sh_dc": [self._features_dc],
             self.class_prefix+"sh_rest": [self._features_rest],
@@ -212,6 +221,9 @@ class VanillaGaussians(nn.Module):
             self.class_prefix+"scaling": [self._scales],
             self.class_prefix+"rotation": [self._quats],
         }
+        if self.id_embedding_dim > 0:# 将高斯id特征加入优化器参数组
+            param_groups[self.class_prefix+"id_features"] = [self._id_features]
+        return param_groups
     
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         return self.get_gaussian_param_groups()
@@ -273,6 +285,12 @@ class VanillaGaussians(nn.Module):
                 self._opacities = Parameter(torch.cat([self._opacities.detach(), split_opacities, dup_opacities], dim=0))
                 self._scales = Parameter(torch.cat([self._scales.detach(), split_scales, dup_scales], dim=0))
                 self._quats = Parameter(torch.cat([self._quats.detach(), split_quats, dup_quats], dim=0))
+                if self.id_embedding_dim > 0:
+                    self._id_features = Parameter(torch.cat([
+                        self._id_features.detach(),
+                        self._id_features[splits].detach().repeat(nsamps, 1),
+                        self._id_features[dups].detach(),
+                    ], dim=0))# 背景高斯分裂、复制时继承 ID 特征
                 
                 # append zeros to the max_2Dsize tensor
                 self.max_2Dsize = torch.cat(
@@ -339,6 +357,8 @@ class VanillaGaussians(nn.Module):
         self._features_dc = Parameter(self._features_dc[~culls].detach())
         self._features_rest = Parameter(self._features_rest[~culls].detach())
         self._opacities = Parameter(self._opacities[~culls].detach())
+        if self.id_embedding_dim > 0:
+            self._id_features = Parameter(self._id_features[~culls].detach())# 裁剪时同步删除 ID 特征
 
         print(f"     Cull: {n_bef - self.num_points}")
         return culls
@@ -471,6 +491,11 @@ class VanillaGaussians(nn.Module):
         self._features_dc = Parameter(torch.zeros((N,) + self._features_dc.shape[1:], device=self.device))
         self._features_rest = Parameter(torch.zeros((N,) + self._features_rest.shape[1:], device=self.device))
         self._opacities = Parameter(torch.zeros((N,) + self._opacities.shape[1:], device=self.device))
+        if self.id_embedding_dim > 0:
+            self.initialize_id_features()# 加载高斯ID特征
+            if "_id_features" not in state_dict:
+                state_dict = state_dict.copy()
+                state_dict["_id_features"] = self._id_features.detach()
         msg = super().load_state_dict(state_dict, **kwargs)
         return msg
     

@@ -57,13 +57,13 @@ class RigidNodes(VanillaGaussians):
         instances_size = []
         instances_fv = []
         point_ids = []
-        for id_in_model, (id_in_dataset, v) in enumerate(instance_pts_dict.items()):
+        for id_in_model, (id_in_dataset, v) in enumerate(instance_pts_dict.items()):# 遍历节点。id_in_model是节点内部id，从0开始；id_in_dataset是时间帧过滤的节点连续id索引
             init_means.append(v["pts"])# 用局部坐标系下实例点云坐标初始化刚性节点高斯位置
             init_colors.append(v["colors"])
             instances_pose.append(v["poses"].unsqueeze(1))
             instances_size.append(v["size"])
             instances_fv.append(v["frame_info"].unsqueeze(1))
-            point_ids.append(torch.full((v["num_pts"], 1), id_in_model, dtype=torch.long))
+            point_ids.append(torch.full((v["num_pts"], 1), id_in_model, dtype=torch.long))# 给这个节点的每个高斯分配相同的节点内部id
         init_means = torch.cat(init_means, dim=0).to(self.device) # (N, 3)
         init_colors = torch.cat(init_colors, dim=0).to(self.device) # (N, 3)
         instances_pose = torch.cat(instances_pose, dim=1).to(self.device) # (num_frame, num_instances, 4, 4)
@@ -97,6 +97,7 @@ class RigidNodes(VanillaGaussians):
         self._features_dc = Parameter(shs[:, 0, :])
         self._features_rest = Parameter(shs[:, 1:, :])
         self._opacities = Parameter(torch.logit(0.1 * torch.ones(self.num_points, 1, device=self.device)))
+        self.initialize_id_features()
         logger.info(f"[{self.class_prefix.rstrip('#')}] Successfully initialized {self.num_points} Gaussians with opacity init value 0.1")
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -181,6 +182,12 @@ class RigidNodes(VanillaGaussians):
                 self._opacities = Parameter(torch.cat([self._opacities.detach(), split_opacities, dup_opacities], dim=0))
                 self._scales = Parameter(torch.cat([self._scales.detach(), split_scales, dup_scales], dim=0))
                 self._quats = Parameter(torch.cat([self._quats.detach(), split_quats, dup_quats], dim=0))
+                if self.id_embedding_dim > 0:
+                    self._id_features = Parameter(torch.cat([
+                        self._id_features.detach(),
+                        self._id_features[splits].detach().repeat(nsamps, 1),
+                        self._id_features[dups].detach(),
+                    ], dim=0))# 刚体高斯分裂、复制时继承 ID 特征
                 self.point_ids = torch.cat([self.point_ids, split_ids, dup_ids], dim=0)
                 
                 # append zeros to the max_2Dsize tensor
@@ -250,6 +257,8 @@ class RigidNodes(VanillaGaussians):
         self._features_dc = Parameter(self._features_dc[~culls].detach())
         self._features_rest = Parameter(self._features_rest[~culls].detach())
         self._opacities = Parameter(self._opacities[~culls].detach())
+        if self.id_embedding_dim > 0:
+            self._id_features = Parameter(self._id_features[~culls].detach())# 裁剪时同步删除 ID 特征
         self.point_ids = self.point_ids[~culls]
 
         print(f"     Cull: {n_bef - self.num_points}")
@@ -517,6 +526,8 @@ class RigidNodes(VanillaGaussians):
             self._features_dc = Parameter(self._features_dc[mask])
             self._features_rest = Parameter(self._features_rest[mask])
             self._opacities = Parameter(self._opacities[mask])
+            if self.id_embedding_dim > 0:
+                self._id_features = Parameter(self._id_features[mask])
             self.point_ids = self.point_ids[mask]
         
     def collect_gaussians_from_ids(self, ids: List[int]) -> Dict:
@@ -532,6 +543,8 @@ class RigidNodes(VanillaGaussians):
                     "_opacities": self._opacities[self.point_ids[..., 0] == id],
                     "point_ids": self.point_ids[self.point_ids[..., 0] == id],
                 }
+                if self.id_embedding_dim > 0:
+                    instance_raw_dict["_id_features"] = self._id_features[self.point_ids[..., 0] == id]
                 gaussian_dict[id] = instance_raw_dict
         return gaussian_dict
 
@@ -555,6 +568,8 @@ class RigidNodes(VanillaGaussians):
             self._features_dc = Parameter(torch.cat([self._features_dc, new_gaussian["_features_dc"]], dim=0))
             self._features_rest = Parameter(torch.cat([self._features_rest, new_gaussian["_features_rest"]], dim=0))
             self._opacities = Parameter(torch.cat([self._opacities, new_gaussian["_opacities"]], dim=0))
+            if self.id_embedding_dim > 0:
+                self._id_features = Parameter(torch.cat([self._id_features, new_gaussian["_id_features"]], dim=0))
             # keeps original point ids
             self.point_ids = torch.cat([self.point_ids, torch.full_like(new_gaussian["point_ids"], ins_id)], dim=0)
     

@@ -38,7 +38,7 @@ class MultiTrainer(BasicTrainer):
             if class_name in self.gaussian_classes:
                 model_cfg = self.model_config.pop(class_name)# 从总配置文件弹出该节点类原始子配置
                 self.model_config[class_name] = self.update_gaussian_cfg(model_cfg)# 更新节点类配置，并重新push进总配置
-            # 初始化高斯，包括背景、刚性、形变、smpl
+            # 初始化高斯，包括背景高斯、刚性节点高斯、形变节点高斯、smpl节点高斯
             if class_name in self.gaussian_classes.keys():
                 model = import_str(model_cfg.type)(
                     **model_cfg,
@@ -191,6 +191,23 @@ class MultiTrainer(BasicTrainer):
                 del self.model_config[class_name]
                 del self.gaussian_classes[class_name]
                 logger.warning(f"Model for {class_name} is removed")
+        
+        if self.identity_cfg is not None and self.identity_cfg.get("enabled", False):
+            from models.identity import IdentityField
+            point_dicts = {"RigidNodes": rigidnode_pts_dict, "SMPLNodes": smplnode_pts_dict,
+                           "DeformableNodes": deformnode_pts_dict}# 三类动态节点的实例字典
+            mapping = {name: list(point_dicts[name]) for name in self.gaussian_classes
+                       if name != "Background"}# 按节点类别的节点连续id索引，保留迭代顺序
+            ids = [idx for values in mapping.values() for idx in values]# 展平的节点连续id索引，未排序
+            source = dataset.pixel_source
+            self.identity_field = IdentityField(
+                self.gaussian_ctrl_general_cfg.id_embedding_dim, mapping,
+                source.instances_pose[:, ids].to(self.device),# 节点的位姿
+                source.instances_size[ids].to(self.device),# 节点的长宽高
+                source.per_frame_instance_mask[:, ids].to(self.device),# 节点在所有时间帧是否存在
+                source.instances_true_id[ids].to(self.device),# 节点的节点连续id
+            )# id模块：初始化背景和每个节点的全局id、分类器
+            logger.info("Identity classes (0=static): %s", mapping)# 打印按节点类别的节点连续id索引
 
         logger.info(f"Initialized gaussians from pcd")# pcd-point cloud data
     # 模型基于当前图像帧的图像和相机信息前向预测高斯rgb图、高斯深度图、高斯不透明度、天空rgb图、经过高斯不透明度过滤的天空rgb图、经过外观仿射变换的完整rgb图
@@ -215,7 +232,7 @@ class MultiTrainer(BasicTrainer):
         normed_time = image_infos["normed_time"].flatten()[0]# 当前图像帧的归一化时间戳
         self.cur_frame = torch.argmin(
             torch.abs(self.normalized_timestamps - normed_time)
-        )# 根据当前图像帧时间戳与目标时间戳的距离，选取距离最小目标时间戳的时间步作为当前图像帧时间步 self.normalized_timestamps：注册的归一化时间戳，0-1之间等间隔取100个时间步
+        )# 根据当前图像帧时间戳与目标时间戳的距离，选取距离最小的目标时间戳的时间步作为当前图像帧时间步 self.normalized_timestamps：注册的归一化时间戳，0-1之间等间隔取100个时间步
         
         # for evaluation
         for model in self.models.values():
@@ -279,7 +296,7 @@ class MultiTrainer(BasicTrainer):
                 outputs["Dynamic_depth"] = sep_depth
         
         return outputs
-
+    # 总loss = 原有重建与正则loss + 2d id loss + 3d id loss（新增loss可以加入此函数）
     def compute_losses(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -287,6 +304,10 @@ class MultiTrainer(BasicTrainer):
         cam_infos: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         loss_dict = super().compute_losses(outputs, image_infos, cam_infos)
+        if self.identity_field is not None:
+            id_losses, self.identity_stats = self.identity_field.compute_losses(
+                outputs, image_infos, cam_infos, self.cur_frame, self.step, self.losses_dict)# 2d id loss+3d id loss
+            loss_dict.update(id_losses)
         
         return loss_dict
     

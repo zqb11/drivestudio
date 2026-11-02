@@ -183,6 +183,8 @@ class DeformableNodes(RigidNodes):
             self._features_dc = Parameter(torch.cat([self._features_dc, new_gaussian["_features_dc"]], dim=0))
             self._features_rest = Parameter(torch.cat([self._features_rest, new_gaussian["_features_rest"]], dim=0))
             self._opacities = Parameter(torch.cat([self._opacities, new_gaussian["_opacities"]], dim=0))
+            if self.id_embedding_dim > 0:
+                self._id_features = Parameter(torch.cat([self._id_features, new_gaussian["_id_features"]], dim=0))
             # keeps original point ids
             self.point_ids = torch.cat([self.point_ids, torch.full_like(new_gaussian["point_ids"], ins_id)], dim=0)
             # replace embeddings

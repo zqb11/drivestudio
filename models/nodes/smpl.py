@@ -167,6 +167,7 @@ class SMPLNodes(RigidNodes):
             shs[:, 0, :3] = torch.logit(init_colors, eps=1e-10)
         self._features_dc   = Parameter(shs[:, 0, :],  requires_grad=not self.ctrl_cfg.freeze_shs_dc)# 从随机rgb初始化0阶SH系数
         self._features_rest = Parameter(shs[:, 1:, :], requires_grad=not self.ctrl_cfg.freeze_shs_rest)# 全0初始化高阶SH系数
+        self.initialize_id_features()
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = self.get_gaussian_param_groups()
@@ -648,6 +649,8 @@ class SMPLNodes(RigidNodes):
                         }
                     }
                 }
+                if self.id_embedding_dim > 0:
+                    instance_raw_dict["_id_features"] = self._id_features[self.point_ids[..., 0] == id]
                 gaussian_dict[id] = instance_raw_dict
         return gaussian_dict
 
@@ -666,6 +669,8 @@ class SMPLNodes(RigidNodes):
             self._features_dc = Parameter(self._features_dc[mask])
             self._features_rest = Parameter(self._features_rest[mask])
             self._opacities = Parameter(self._opacities[mask])
+            if self.id_embedding_dim > 0:
+                self._id_features = Parameter(self._id_features[mask])
             self.point_ids = self.point_ids[mask]
             ins_mask = torch.ones(self.num_instances, device=self.device, dtype=torch.bool)
             ins_mask[ins_ids] = 0
@@ -696,6 +701,8 @@ class SMPLNodes(RigidNodes):
             # self._features_rest = Parameter(torch.cat([self._features_rest, new_gaussian["_features_rest"]], dim=0))
             # self._opacities = Parameter(torch.cat([self._opacities, new_gaussian["_opacities"]], dim=0))
             self._features_dc.data[self.point_ids[..., 0] == ins_id] = new_gaussian["_features_dc"]
+            if self.id_embedding_dim > 0:
+                self._id_features.data[self.point_ids[..., 0] == ins_id] = new_gaussian["_id_features"]
             # keeps original point ids
             # self.point_ids = torch.cat([self.point_ids, torch.full_like(new_gaussian["point_ids"], ins_id)], dim=0)
             # self.template.add_instance(ins_id, new_gaussian["smpl_template"])
