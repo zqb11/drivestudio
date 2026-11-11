@@ -74,6 +74,11 @@ class VanillaGaussians(nn.Module):
         self._features_dc = torch.zeros(1, 3, device=self.device)# 全0初始化0阶SH系数
         self._features_rest = torch.zeros(1, num_sh_bases(self.sh_degree) - 1, 3, device=self.device)# 全0初始化高阶SH系数：(1, 除去0阶的SH系数个数, 3)
         self.initialize_id_features()# 随机初始化高斯归属id特征，背景、刚性、smpl、可形变都调用
+        cleanup_cfg = self.ctrl_cfg.get("residual_clean")# 清理配置
+        self.cleanup = None
+        if class_name == "Background" and cleanup_cfg is not None and cleanup_cfg.enabled:
+            from models.background_cleanup import BackgroundCleanup
+            self.cleanup = BackgroundCleanup(cleanup_cfg, self.device)# 初始化背景残影高斯清理模块
 
     def initialize_id_features(self) -> None:
         if self.id_embedding_dim > 0:
@@ -158,7 +163,7 @@ class VanillaGaussians(nn.Module):
             else:
                 return torch.exp(self._scales)
     @property
-    def get_opacity(self):
+    def get_opacity(self):# 原始不透明度[0, 1]
         return torch.sigmoid(self._opacities)
     @property
     def get_quats(self):
@@ -166,10 +171,10 @@ class VanillaGaussians(nn.Module):
     
     def quat_act(self, x: torch.Tensor) -> torch.Tensor:
         return x / x.norm(dim=-1, keepdim=True)
-    
+    # 四类高斯训练前处理：获取训练步数
     def preprocess_per_train_step(self, step: int):
         self.step = step
-    # 背景高斯训练后处理
+    # 背景/刚性节点/可形变节点高斯训练后处理
     def postprocess_per_train_step(
         self,
         step: int,
@@ -178,10 +183,10 @@ class VanillaGaussians(nn.Module):
         xys_grad: torch.Tensor,
         last_size: int,
     ) -> None:
-        self.after_train(radii, xys_grad, last_size)# 梯度累加
-        if step % self.ctrl_cfg.refine_interval == 0:
-            self.refinement_after(step, optimizer)# 致密化主体：分裂、复制、修剪、重置不透明度
-    # 梯度累加
+        self.after_train(radii, xys_grad, last_size)# 累计有效投影高斯的梯度模长、观测次数和最大屏幕尺寸
+        if step % self.ctrl_cfg.refine_interval == 0:# 每隔增密周期
+            self.refinement_after(step, optimizer)# 致密化：分裂、复制、裁剪、压低不透明度
+    # 累计有效投影高斯的梯度模长、观测次数和最大屏幕尺寸
     def after_train(
         self,
         radii: torch.Tensor,
@@ -227,7 +232,7 @@ class VanillaGaussians(nn.Module):
     
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         return self.get_gaussian_param_groups()
-    # 致密化主体：分裂、复制、修剪、重置不透明度
+    # 致密化：分裂、复制、裁剪、压低不透明度
     def refinement_after(self, step, optimizer: torch.optim.Optimizer) -> None:
         assert step == self.step
         if self.step <= self.ctrl_cfg.warmup_steps:
@@ -238,15 +243,15 @@ class VanillaGaussians(nn.Module):
             do_densification = (
                 self.step < self.ctrl_cfg.stop_split_at
                 and self.step % reset_interval > max(self.num_train_images, self.ctrl_cfg.refine_interval)
-            )
+            )# 判断本次是否允许增密：未到达停止增密的训练步数 且 距离当前不透明度重置周期起点已经足够久
             # split & duplicate
             print(f"Class {self.class_prefix} current points: {self.num_points} @ step {self.step}")
             if do_densification:
                 assert self.xys_grad_norm is not None and self.vis_counts is not None and self.max_2Dsize is not None
-                
+                # 找出平均二维位置梯度较大的高斯
                 avg_grad_norm = self.xys_grad_norm / self.vis_counts
                 high_grads = (avg_grad_norm > self.ctrl_cfg.densify_grad_thresh).squeeze()
-                
+                # 对“梯度大且尺寸大”的高斯执行分裂
                 splits = (
                     self.get_scaling.max(dim=-1).values > \
                         self.ctrl_cfg.densify_size_thresh * self.scene_scale
@@ -263,7 +268,7 @@ class VanillaGaussians(nn.Module):
                     split_scales,
                     split_quats,
                 ) = self.split_gaussians(splits, nsamps)
-
+                # 对“梯度大且尺寸小”的高斯执行复制
                 dups = (
                     self.get_scaling.max(dim=-1).values <= \
                         self.ctrl_cfg.densify_size_thresh * self.scene_scale
@@ -277,7 +282,7 @@ class VanillaGaussians(nn.Module):
                     dup_scales,
                     dup_quats,
                 ) = self.dup_gaussians(dups)
-                
+                # 将新增高斯追加到参数张量
                 self._means = Parameter(torch.cat([self._means.detach(), split_means, dup_means], dim=0))
                 # self.colors_all = Parameter(torch.cat([self.colors_all.detach(), split_colors, dup_colors], dim=0))
                 self._features_dc = Parameter(torch.cat([self._features_dc.detach(), split_feature_dc, dup_feature_dc], dim=0))
@@ -291,6 +296,8 @@ class VanillaGaussians(nn.Module):
                         self._id_features[splits].detach().repeat(nsamps, 1),
                         self._id_features[dups].detach(),
                     ], dim=0))# 背景高斯分裂、复制时继承 ID 特征
+                if self.cleanup is not None:
+                    self.cleanup.append(splits, dups, nsamps)
                 
                 # append zeros to the max_2Dsize tensor
                 self.max_2Dsize = torch.cat(
@@ -308,13 +315,14 @@ class VanillaGaussians(nn.Module):
 
             # cull NOTE: Offset all the opacity reset logic by refine_every so that we don't
                 # save checkpoints right when the opacity is reset (saves every 2k)
+            # 按条件裁剪高斯
             if self.step % reset_interval > max(self.num_train_images, self.ctrl_cfg.refine_interval):
                 deleted_mask = self.cull_gaussians()
                 param_groups = self.get_gaussian_param_groups()
                 remove_from_optim(optimizer, deleted_mask, param_groups)
             print(f"Class {self.class_prefix} left points: {self.num_points}")
                     
-            # reset opacity
+            # reset opacity 周期性压低不透明度
             if self.step % reset_interval == self.ctrl_cfg.refine_interval:
                 # NOTE: in nerfstudio, reset_value = cull_alpha_thresh * 0.8
                     # we align to original repo of gaussians spalting
@@ -331,14 +339,16 @@ class VanillaGaussians(nn.Module):
             self.xys_grad_norm = None
             self.vis_counts = None
             self.max_2Dsize = None
-
+    # 高斯裁剪，包括原始不透明度低于阈值的高斯、残影高斯、尺度过大的高斯和屏幕投影尺寸过大的高斯
     def cull_gaussians(self):
         """
         This function deletes gaussians with under a certain opacity threshold
         """
         n_bef = self.num_points
         # cull transparent ones
-        culls = (self.get_opacity.data < self.ctrl_cfg.cull_alpha_thresh).squeeze()
+        culls = (self.get_opacity.data < self.ctrl_cfg.cull_alpha_thresh).squeeze()# 裁剪高斯数组：标记不透明度小于阈值的高斯
+        if self.cleanup is not None and self.cleanup.instance.numel():
+            culls |= self.cleanup.deletion_mask(self.step)# 裁剪集合：标记不透明度小于阈值的 或 当前确认是残影且年龄大于阈值的
         if self.step > self.ctrl_cfg.reset_alpha_interval:
             # cull huge ones
             toobigs = (
@@ -350,6 +360,9 @@ class VanillaGaussians(nn.Module):
                 # cull big screen space
                 assert self.max_2Dsize is not None
                 culls = culls | (self.max_2Dsize > self.ctrl_cfg.cull_screen_size).squeeze()
+        if self.cleanup is not None:
+            self.cleanup.retain(culls)# 同步删除残影清理模块中的被裁剪高斯属性
+        # 实际裁剪
         self._means = Parameter(self._means[~culls].detach())
         self._scales = Parameter(self._scales[~culls].detach())
         self._quats = Parameter(self._quats[~culls].detach())
@@ -358,7 +371,7 @@ class VanillaGaussians(nn.Module):
         self._features_rest = Parameter(self._features_rest[~culls].detach())
         self._opacities = Parameter(self._opacities[~culls].detach())
         if self.id_embedding_dim > 0:
-            self._id_features = Parameter(self._id_features[~culls].detach())# 裁剪时同步删除 ID 特征
+            self._id_features = Parameter(self._id_features[~culls].detach())# 删除裁剪高斯 ID 特征
 
         print(f"     Cull: {n_bef - self.num_points}")
         return culls

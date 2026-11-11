@@ -20,7 +20,7 @@ class MultiTrainer(BasicTrainer):
         self.render_each_class = True
         
     def register_normalized_timestamps(self, num_timestamps: int):
-        self.normalized_timestamps = torch.linspace(0, 1, num_timestamps, device=self.device)
+        self.normalized_timestamps = torch.linspace(0, 1, num_timestamps, device=self.device)# 归一化时间戳
     # 初始化高斯场景图的高斯和模块，并归一化时间步
     def _init_models(self):
         # gaussian model classes高斯场景图高斯类赋值为枚举整型
@@ -63,6 +63,7 @@ class MultiTrainer(BasicTrainer):
         
         # register normalized timestamps注册归一化时间戳
         self.register_normalized_timestamps(self.num_timesteps)
+
         for class_name in self.gaussian_classes.keys():
             model = self.models[class_name]
             if hasattr(model, 'register_normalized_timestamps'):
@@ -229,10 +230,10 @@ class MultiTrainer(BasicTrainer):
         """
 
         # set current time or use temporal smoothing
-        normed_time = image_infos["normed_time"].flatten()[0]# 当前图像帧的归一化时间戳
+        normed_time = image_infos["normed_time"].flatten()[0]# 目标图像的归一化时间戳，本次希望渲染的时间，以下称为目标时间戳
         self.cur_frame = torch.argmin(
             torch.abs(self.normalized_timestamps - normed_time)
-        )# 根据当前图像帧时间戳与目标时间戳的距离，选取距离最小的目标时间戳的时间步作为当前图像帧时间步 self.normalized_timestamps：注册的归一化时间戳，0-1之间等间隔取100个时间步
+        )# 根据场景中各个时间帧的归一化时间戳与目标时间戳的距离，选取相差最小的归一化时间戳索引作为当前渲染的时间步 self.normalized_timestamps：注册的归一化时间戳，0-1之间等间隔取100个时间步
         
         # for evaluation
         for model in self.models.values():
@@ -250,14 +251,11 @@ class MultiTrainer(BasicTrainer):
             camera_infos=camera_infos,
             image_ids=image_infos["img_idx"].flatten()[0],
             novel_view=novel_view
-        )# 训练过程微调相机位姿，获得图像帧对应的相机信息(图像宽高、内参、初始相机位姿、微调之后的相机位姿)
+        )# 训练过程微调相机位姿，获得目标相机信息(图像宽高、内参、初始相机位姿、微调之后的相机位姿)
         gs = self.collect_gaussians(
             cam=processed_cam,
             image_ids=image_infos["img_idx"].flatten()[0]
-        )# 获取图像帧相机位姿下的所有高斯属性(冻结可选)
-        # 调试：最小最大不透明度
-        # print(f"Min/Max opacities: {gs.opacities.squeeze().min()}, {gs.opacities.squeeze().max()}")
-        # render gaussians
+        )# 获取目标相机位姿下的所有高斯属性(冻结可选)
         outputs, render_fn = self.render_gaussians(
             gs=gs,
             cam=processed_cam,
@@ -308,6 +306,11 @@ class MultiTrainer(BasicTrainer):
             id_losses, self.identity_stats = self.identity_field.compute_losses(
                 outputs, image_infos, cam_infos, self.cur_frame, self.step, self.losses_dict)# 2d id loss+3d id loss
             loss_dict.update(id_losses)
+        background = self.models["Background"]
+        if background.cleanup is not None and self.step >= background.cleanup.cfg.start_step:
+            background.cleanup.update(background, self.identity_field, outputs["id_labels"],
+                                      image_infos, cam_infos, int(self.cur_frame), self.step)# 更新背景高斯的静态/自由/动态支持时间帧掩码和支持帧数、动态支持相机掩码和相机数，得到背景高斯首次被确认是残影的训练步数
+            loss_dict["background_clean_loss"] = background.cleanup.loss(background, self.step)
         
         return loss_dict
     

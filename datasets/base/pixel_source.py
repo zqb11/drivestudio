@@ -140,6 +140,7 @@ class CameraData(object):
         if load_sky_mask:
             self.load_sky_masks()# 加载当前视角的调整宽高、去畸变的天空mask
         self.lidar_depth_maps = None # will be loaded by: self.load_depth()
+        self.cleanup_depth_maps = None
         self.image_error_maps = None # will be built by: self.build_image_error_buffer()
         self.to(self.device)
         self.downscale_factor = 1.0
@@ -377,8 +378,11 @@ class CameraData(object):
     def load_depth(
         self,
         lidar_depth_maps: Tensor,
+        cleanup_depth_maps: Tensor = None,
     ):
         self.lidar_depth_maps = lidar_depth_maps.to(self.device)
+        if cleanup_depth_maps is not None:
+            self.cleanup_depth_maps = cleanup_depth_maps.to(self.device)
         
     def load_time(
         self,
@@ -471,6 +475,8 @@ class CameraData(object):
             self.sky_masks = self.sky_masks.to(device)
         if self.lidar_depth_maps is not None:
             self.lidar_depth_maps = self.lidar_depth_maps.to(device)
+        if self.cleanup_depth_maps is not None:
+            self.cleanup_depth_maps = self.cleanup_depth_maps.to(device)
         if self.image_error_maps is not None:
             self.image_error_maps = self.image_error_maps.to(device)
     
@@ -600,6 +606,16 @@ class CameraData(object):
                 # else:
                 lidar_depth_map = sparse_lidar_map_downsampler(lidar_depth_map, self.downscale_factor)
 
+        cleanup_depth_map = None
+        if self.cleanup_depth_maps is not None:
+            cleanup_depth_map = self.cleanup_depth_maps[frame_idx]
+            if self.downscale_factor != 1.0:
+                cleanup_depth_map = torch.nn.functional.interpolate(
+                    cleanup_depth_map.unsqueeze(0).unsqueeze(0),
+                    size=(img_height, img_width),
+                    mode="nearest",
+                ).squeeze(0).squeeze(0)
+
         if self.normalized_time is not None:
             normalized_time = torch.full(
                 (img_height, img_width),
@@ -643,6 +659,7 @@ class CameraData(object):
             "vehicle_masks": vehicle_mask,
             "egocar_masks": egocar_mask,
             "lidar_depth_map": lidar_depth_map,
+            "cleanup_depth_map": cleanup_depth_map,
         }
         image_infos = {k: v for k, v in _image_infos.items() if v is not None}# 图像帧索引对应的目标图像信息
         

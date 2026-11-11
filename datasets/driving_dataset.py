@@ -630,8 +630,10 @@ class DrivingDataset(SceneDataset):
             delete_out_of_view_points: bool
                 If True, the lidar points that are not visible from the camera will be removed.
         """
+        load_cleanup_depth = self.pixel_source.data_cfg.get("load_cleanup_depth", False)
         for cam in self.pixel_source.camera_data.values():# 遍历视角
             lidar_depth_maps = []# 当前视角所有时间帧的深度图
+            cleanup_depth_maps = [] if load_cleanup_depth else None
             for frame_idx in tqdm(
                 range(len(cam)), 
                 desc="Projecting lidar pts on images for camera {}".format(cam.cam_name),
@@ -686,10 +688,16 @@ class DrivingDataset(SceneDataset):
                 depth_map[
                     _cam_points[:, 1].long(), _cam_points[:, 0].long()
                 ] = depth.squeeze(-1)# 深度图：将像素坐标向下取整(存在重合的像素坐标)作为索引，对应的深度值填入深度图中
-                # 调试：打印深度图有效像素坐标，发现存在有效像素
-                # coords = torch.nonzero(depth_map)
-                # print(coords)
+      
                 lidar_depth_maps.append(depth_map)
+                if load_cleanup_depth:#增加独立的清理深度图：当像素被多个Lidar点命中时，取最近 LiDAR 深度，没有命中的像素深度为0
+                    cleanup_depth_map = depth.new_full((cam.HEIGHT * cam.WIDTH,), torch.inf)
+                    pixel_indices = _cam_points[:, 1].long() * cam.WIDTH + _cam_points[:, 0].long()
+                    cleanup_depth_map.scatter_reduce_(
+                        0, pixel_indices, depth, reduce="amin", include_self=True
+                    )
+                    cleanup_depth_map[torch.isinf(cleanup_depth_map)] = 0
+                    cleanup_depth_maps.append(cleanup_depth_map.reshape(cam.HEIGHT, cam.WIDTH))# 所有时间帧的清理深度图
                 
                 # used to filter out the lidar points that are visible from the camera
                 visible_indices = torch.arange(
@@ -705,7 +713,9 @@ class DrivingDataset(SceneDataset):
                 self.lidar_source.colors[visible_indices] = points_color# 将颜色值赋给当前视角当前时间帧有效点的颜色属性
 
             cam.load_depth(
-                torch.stack(lidar_depth_maps, dim=0).to(self.device).float()
+                torch.stack(lidar_depth_maps, dim=0).to(self.device).float(),
+                cleanup_depth_maps=(torch.stack(cleanup_depth_maps, dim=0).float()
+                                    if load_cleanup_depth else None),
             )# 加载当前视角所有时间帧的目标深度图
             
         if delete_out_of_view_points:

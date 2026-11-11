@@ -83,7 +83,7 @@ class IdentityField(nn.Module):
         return result
     #id损失计算
     def compute_losses(self, outputs, image_infos, cam_infos, frame, step, cfg):
-        labels = self.image_labels(image_infos, cam_infos, frame)# 计算目标图像的目标id图：弱标签，非目标id标注
+        labels = self.image_labels(image_infos, cam_infos, frame)# 计算目标图像的像素投影id图：弱标签，非目标id标注
         outputs["id_labels"] = labels
         losses = {}
         stats = {"valid_pixels": (labels >= 0).sum().item(),# 目标图像的背景和有效动态像素数
@@ -93,7 +93,7 @@ class IdentityField(nn.Module):
             logits2d = self.classifier(outputs["id_features"])# 目标图像的id分数图（未经softmax）
             losses["id_2d_loss"] = cfg2d.w * masked_id_cross_entropy(
                 logits2d, labels,
-                outputs["opacity"], cfg2d.get("min_opacity", 0.05))# 2d id loss：监督像素的目标id和id分数的交叉熵损失
+                outputs["opacity"], cfg2d.get("min_opacity", 0.05))# 2d id loss：监督像素的投影id和id分数的交叉熵损失
             with torch.no_grad():
                 dynamic = labels > 0
                 stats["dynamic_id_accuracy"] = (
@@ -101,7 +101,7 @@ class IdentityField(nn.Module):
                     if dynamic.any() else 0.0)
         cfg3d = cfg.get("id_3d", {})# 3D ID损失配置
         if id_3d_enabled(step, cfg3d):# 从25K步开始启用3d id loss
-            gs, camera = outputs["id_gaussians"], outputs["id_camera"]# 目标图像时间帧的高斯属性和目标图像相机信息
+            gs, camera = outputs["id_gaussians"], outputs["id_camera"]# 目标时间帧的高斯属性和目标相机信息
             loss3d, stats3d = spatial_id_kl(# 输入参数：世界空间高斯中心、高斯的归属id分数、高斯的目标归属id、高斯不透明度、有效高斯的像素投影弱标签、3D ID损失配置
                 gs.means, self.classifier(gs.extras["id_features"]),
                 gs.extras["instance_ids"], gs.opacities.reshape(-1),

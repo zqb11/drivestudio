@@ -282,7 +282,7 @@ class BasicTrainer(nn.Module):
     def preprocess_per_train_step(self, step: int) -> None:
         self.step = step
         for class_name in self.gaussian_classes.keys():
-            self.models[class_name].preprocess_per_train_step(step)
+            self.models[class_name].preprocess_per_train_step(step)# 四类高斯训练前处理：获取训练步数
 
         # viewer
         if self.viewer is not None:
@@ -290,18 +290,22 @@ class BasicTrainer(nn.Module):
                 time.sleep(0.01)
             self.viewer.lock.acquire()
             self.tic = time.time()
-        
+    # 训练后处理
     def postprocess_per_train_step(self, step: int) -> None:
-        radii = self.info["radii"]
-        if self.render_cfg.absgrad:
+        radii = self.info["radii"]# 高斯这次渲染的投影半径
+        if self.render_cfg.absgrad:# 损失对高斯二维投影中心的梯度
             grads = self.info["means2d"].absgrad.clone()# 取绝对梯度
         else:
             grads = self.info["means2d"].grad.clone()
+        # 按图像尺寸还原梯度
         grads[..., 0] *= self.info["width"] / 2.0 * self.render_cfg.batch_size# 还原尺度
         grads[..., 1] *= self.info["height"] / 2.0 * self.render_cfg.batch_size
-        # 按类别切分并分发
+        # 按高斯类别切分并分发梯度
         for class_name in self.gaussian_classes.keys():
-            gaussian_mask = self.pts_labels == self.gaussian_classes[class_name]
+            gaussian_mask = self.pts_labels == self.gaussian_classes[class_name]# 本次渲染中属于该类别的高斯掩码
+            model = self.models[class_name]
+            if getattr(model, "cleanup", None) is not None:
+                model.cleanup.capture_gradient(model)
             
             self.models[class_name].postprocess_per_train_step(
                 step=step,
@@ -309,9 +313,9 @@ class BasicTrainer(nn.Module):
                 radii=radii[0, gaussian_mask],
                 xys_grad=grads[0, gaussian_mask],
                 last_size=max(self.info["width"], self.info["height"])
-            )
+            )# 各类别高斯的训练后处理
         
-        # viewer
+        # 更新viewer
         if self.viewer is not None:
             num_train_rays_per_step = self.render_cfg.batch_size * self.info["width"] * self.info["height"]
             self.viewer.lock.release()
@@ -323,11 +327,11 @@ class BasicTrainer(nn.Module):
             self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
             # Update the scene.
             self.viewer.update(step, num_train_rays_per_step)
-    # 更新高斯类别的2D溅射块半径，是后续点云密化、修剪或调整学习率的几何依据
+    # 保存四个高斯类在本次渲染的2D溅射块半径
     def update_visibility_filter(self) -> None:
         for class_name in self.gaussian_classes.keys():
-            gaussian_mask = self.pts_labels == self.gaussian_classes[class_name]# 3D高斯球类别掩码，属于这个类别的为true
-            self.models[class_name].cur_radii = self.info["radii"][0, gaussian_mask]# 更新该类别的2D溅射块半径
+            gaussian_mask = self.pts_labels == self.gaussian_classes[class_name]# 高斯类别掩码，属于这个类别的为true
+            self.models[class_name].cur_radii = self.info["radii"][0, gaussian_mask]# 保存该类别高斯在本次渲染的2D溅射块半径
     # 训练过程微调相机位姿，获得相机信息(图像宽高、内参、初始相机位姿、微调之后的相机位姿)
     def process_camera(
         self,
@@ -353,7 +357,7 @@ class BasicTrainer(nn.Module):
         )
         
         return camera_dict
-    # 获取当前图像帧相机位姿下的所有高斯属性(冻结可选)
+    # 获取目标相机位姿下的所有高斯属性(冻结可选)
     def collect_gaussians(
         self,
         cam: dataclass_camera,
@@ -369,9 +373,12 @@ class BasicTrainer(nn.Module):
         }# 当前相机位姿下所有高斯属性
         id_features, instance_ids = [], []
         for class_name in self.gaussian_classes.keys():# 遍历高斯类
-            gs = self.models[class_name].get_gaussians(cam)# 获取当前相机位姿下当前类别高斯属性(中心点坐标、尺度、朝向、颜色和不透明度)
+            gs = self.models[class_name].get_gaussians(cam)# 获取目标相机位姿下当前类别高斯属性(中心点坐标、尺度、朝向、颜色和不透明度)
             if gs is None:
                 continue
+            model = self.models[class_name]
+            if getattr(model, "cleanup", None) is not None:
+                gs["_opacities"] = model.cleanup.apply_gate(model.get_opacity, self.step)[model.filter_mask]# 对背景残影高斯的不透明度添加门控：随着训练步数增加而逐渐降低不透明度
             if self.identity_field is not None:
                 model = self.models[class_name]
                 id_features.append(model._id_features[model.filter_mask])# 这个类别高斯的归属id特征
@@ -385,7 +392,7 @@ class BasicTrainer(nn.Module):
             gs_dict[k] = torch.cat(v, dim=0)
             
         # get the class labels
-        self.pts_labels = gs_dict.pop("class_labels")# 当前图像帧所有高斯类别
+        self.pts_labels = gs_dict.pop("class_labels")# 所有高斯类别：0-背景、1-刚性节点、2-SMPL节点、3-可变形节点
         if self.render_dynamic_mask:
             self.dynamic_pts_mask = (self.pts_labels != 0).float()
 
@@ -396,9 +403,9 @@ class BasicTrainer(nn.Module):
             _rgbs=gs_dict["_rgbs"],
             _opacities=gs_dict["_opacities"],
             detach_keys=[],    # if "means" in detach_keys, then the means will be detached
-            extras={"id_features": torch.cat(id_features), "instance_ids": torch.cat(instance_ids)}# 所有高斯的归属id特征和归属id
+            extras={"id_features": torch.cat(id_features), "instance_ids": torch.cat(instance_ids)}# 添加所有高斯的归属id特征和归属id
                 if self.identity_field is not None else None
-        )# 当前图像帧相机位姿下所有高斯属性：有_是原始属性，无_是根据detach_keys决定的冻结或不冻结属性
+        )# 目标相机位姿下所有高斯属性：有_是原始渲染属性，无_是根据detach_keys决定的冻结或不冻结属性；不在detach_keys的属性会得到优化
         
         return gaussians
     # 基于初始化的高斯，利用高斯溅射和光栅化渲染，得到结果字典(rgb图、预测深度图、不透明度图)、高斯溅射+光栅化渲染函数
@@ -463,8 +470,8 @@ class BasicTrainer(nn.Module):
                     **feature_kwargs,
                 )
                 results["id_features"] = features[0] / feature_alpha[0].clamp_min(1e-6)# 高斯不透明度权重归一化，得到加权平均的id特征图，降低每个高斯的不透明度权重，进而降低像素被高斯覆盖了多少对id学习的影响，使得根据id特征学习id更容易
-                results["id_gaussians"] = gs# 目标图像时间帧的高斯属性
-                results["id_camera"] = cam# 目标图像相机信息
+                results["id_gaussians"] = gs# 目标时间帧的高斯属性
+                results["id_camera"] = cam# 目标相机信息
         
         return results, render_fn
     # 渲染图像外观仿射变换
@@ -538,16 +545,16 @@ class BasicTrainer(nn.Module):
     
     def backward(self, loss_dict: Dict[str, torch.Tensor]) -> None:
         # ----------------- backward ----------------
-        total_loss = sum(loss for loss in loss_dict.values())
-        self.grad_scaler.scale(total_loss).backward()
-        self.optimizer_step()
-        
+        total_loss = sum(loss for loss in loss_dict.values())# 将各项损失相加
+        self.grad_scaler.scale(total_loss).backward()# 损失沿计算图反向求导，将梯度写入各个参与计算参数的grad属性，并进行缩放，防止梯度爆炸
+        self.optimizer_step()# 优化器Adam更新参数：根据参数梯度、历史动量和各参数组的学习率更新参数
+        # 获取缩放系数，并更新缩放器
         scale = self.grad_scaler.get_scale()
         self.grad_scaler.update()
         
         # If the gradient scaler is decreased, no optimization step is performed so we should not step the scheduler.
         if scale <= self.grad_scaler.get_scale():
-            for group in self.optimizer.param_groups:
+            for group in self.optimizer.param_groups:# 更新各参数组的学习率
                 if group["name"] in self.lr_schedulers:
                     new_lr = self.lr_schedulers[group["name"]](self.step)
                     group["lr"] = new_lr

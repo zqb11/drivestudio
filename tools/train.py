@@ -196,9 +196,9 @@ def main(args):
     #     args=args,
     # )
 
-    for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):# 遍历迭代步数
+    for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):# 遍历训练步数
         #----------------------------------------------------------------------------
-        #----------------------------     Validate(每隔一定迭代步数可视化训练状态)     ------------------------------
+        #----------------------------     Validate(每隔一定训练步数可视化训练状态)     ------------------------------
         if step % cfg.logging.vis_freq == 0 and cfg.logging.vis_freq > 0:# 每隔vis_freq可视化训练状态
             logger.info("Visualizing...")
             vis_timestep = np.linspace(
@@ -252,8 +252,8 @@ def main(args):
         #----------------------------  training step  -------------------------------
         # prepare for training
         trainer.set_train()
-        trainer.preprocess_per_train_step(step=step)# 获取高斯类的迭代步数
-        trainer.optimizer_zero_grad() # zero grad
+        trainer.preprocess_per_train_step(step=step)# 训练前处理：获取四类高斯的训练步数；viewer暂停
+        trainer.optimizer_zero_grad() # zero grad：梯度清零
         
         # get data
         train_step_camera_downscale = trainer._get_downscale_factor()# 训练和测试评估阶段的图像降采样倍数
@@ -266,8 +266,8 @@ def main(args):
                 cam_infos[k] = v.cuda(non_blocking=True)
         
         # forward & backward
-        outputs = trainer(image_infos, cam_infos)# 模型基于选择的目标图像和相机信息前向预测高斯rgb图、高斯深度图、高斯不透明度、天空rgb图、经过高斯不透明度过滤的天空rgb图、经过外观仿射变换的完整rgb图
-        trainer.update_visibility_filter()# 更新高斯类别的2D溅射块半径，是后续点云密化、修剪或调整学习率的几何依据
+        outputs = trainer(image_infos, cam_infos)# 联合渲染：模型基于选择的目标图像和相机信息前向预测高斯rgb图、高斯深度图、高斯不透明度、天空rgb图、经过高斯不透明度过滤的天空rgb图、经过外观仿射变换的完整rgb图
+        trainer.update_visibility_filter()# 保存四个高斯类在本次渲染的2D溅射块半径
 
         loss_dict = trainer.compute_losses(
             outputs=outputs,
@@ -289,11 +289,13 @@ def main(args):
                 raise ValueError(f"NaN detected in loss {k} at step {step}")
             if torch.isinf(v).any():
                 raise ValueError(f"Inf detected in loss {k} at step {step}")
-        trainer.backward(loss_dict)# 损失反向传播
+        trainer.backward(loss_dict)# 损失累加，反向传播计算梯度，更新参数
         
-        # after training step 每个训练步的后处理
-        trainer.postprocess_per_train_step(step=step)
-        
+        # after training step 
+        trainer.postprocess_per_train_step(step=step)# 训练后处理：梯度分发；各类别高斯后处理；viewer更新
+        cleanup = getattr(trainer.models.get("Background"), "cleanup", None)
+        if cleanup is not None:
+            cleanup.report(trainer.models["Background"], step, cfg.log_dir)# 背景残影清理效果监测
         #----------------------------------------------------------------------------
         #-------------------------------  logging  ----------------------------------
         with torch.no_grad():
