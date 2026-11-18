@@ -348,7 +348,7 @@ class VanillaGaussians(nn.Module):
         # cull transparent ones
         culls = (self.get_opacity.data < self.ctrl_cfg.cull_alpha_thresh).squeeze()# 裁剪高斯数组：标记不透明度小于阈值的高斯
         if self.cleanup is not None and self.cleanup.instance.numel():
-            culls |= self.cleanup.deletion_mask(self.step)# 裁剪集合：标记不透明度小于阈值的 或 当前确认是残影且年龄大于阈值的
+            culls &= ~self.cleanup.protected_mask(self.step)
         if self.step > self.ctrl_cfg.reset_alpha_interval:
             # cull huge ones
             toobigs = (

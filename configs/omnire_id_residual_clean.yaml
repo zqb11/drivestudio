@@ -105,18 +105,22 @@ model:
         gate_ramp_steps: 3000
         max_gate: 1.0
         delete_after_steps: 3500
-        evidence_interval: 10
+        audit_interval: 1000
+        discovery_steps: [25000, 30000, 35000]
+        min_confirmed_rounds: 2
         max_points_per_update: 150000
         id_confidence: 0.6
         box_margin: 0.2
         depth_neighborhood: 1
+        min_depth_neighbors: 2
+        fill_depth_margin: 0.2
+        fill_depth_relative_margin: 0.005
+        boundary_margin_pixels: 2
+        footprint_sigma: 2.0
         surface_margin: 0.25
         surface_relative_margin: 0.005
-        free_margin: 0.5
-        free_relative_margin: 0.01
-        min_support_frames: 3
-        min_free_frames: 2
-        min_cameras: 1
+        min_support_frames: 8
+        min_cameras: 2
         static_veto_frames: 2
         report_interval: 100
         monitor_interval: 500

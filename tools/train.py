@@ -254,6 +254,14 @@ def main(args):
         trainer.set_train()
         trainer.preprocess_per_train_step(step=step)# 训练前处理：获取四类高斯的训练步数；viewer暂停
         trainer.optimizer_zero_grad() # zero grad：梯度清零
+
+        cleanup = getattr(trainer.models.get("Background"), "cleanup", None)
+        if cleanup is not None and step != trainer.num_iters and cleanup.should_audit(step):
+            cleanup.audit(
+                trainer.models["Background"], trainer.identity_field, dataset.train_image_set,
+                step, trainer.optimizer, discover=int(step) in cleanup.cfg.discovery_steps,
+                log_dir=cfg.log_dir,
+            )
         
         # get data
         train_step_camera_downscale = trainer._get_downscale_factor()# 训练和测试评估阶段的图像降采样倍数
@@ -293,8 +301,13 @@ def main(args):
         
         # after training step 
         trainer.postprocess_per_train_step(step=step)# 训练后处理：梯度分发；各类别高斯后处理；viewer更新
-        cleanup = getattr(trainer.models.get("Background"), "cleanup", None)
         if cleanup is not None:
+            if step == trainer.num_iters and cleanup.should_audit(step, final=True):
+                cleanup.audit(
+                    trainer.models["Background"], trainer.identity_field, dataset.train_image_set,
+                    step, trainer.optimizer, discover=int(step) in cleanup.cfg.discovery_steps,
+                    log_dir=cfg.log_dir,
+                )
             cleanup.report(trainer.models["Background"], step, cfg.log_dir)# 背景残影清理效果监测
         #----------------------------------------------------------------------------
         #-------------------------------  logging  ----------------------------------

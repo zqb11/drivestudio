@@ -1,4 +1,9 @@
-"""Evidence-based removal of static Gaussians left on moving vehicles."""
+"""Full-sequence, reversible cleanup of background Gaussians on moving instances.
+
+ID learning is adapted from DIAL-GS; covariance projection follows 3DGS.
+Audit scheduling, conditional depth completion, boundary protection, opacity
+recovery and cleanup thresholds are project designs, not paper reproductions.
+"""
 import json
 import logging
 import os
@@ -9,32 +14,40 @@ from torch.nn import functional as F
 
 logger = logging.getLogger()
 
-# 背景残影高斯清理模块
+
 class BackgroundCleanup(nn.Module):
     point_fields = (
-        "instance", "support_count", "free_count", "static_count", "camera_bits",
-        "support_bits", "free_bits", "static_bits", "confirmed_at", "monitor_mask", "monitor_initial",
+        "instance", "support_count", "static_count", "camera_bits",
+        "support_bits", "static_bits", "checked_bits", "observed_bits", "unknown_bits", "conflict_bits",
+        "checked_count", "observed_count", "unknown_count", "conflict_count",
+        "confirmed_at", "confirmed_rounds", "before_clean_opacity", "monitor_mask", "monitor_initial",
     )
+    evidence_kinds = ("support", "static", "checked", "observed", "unknown", "conflict")
 
     def __init__(self, cfg, device):
         super().__init__()
         self.cfg = cfg
         for name in self.point_fields:
-            dtype = torch.bool if name == "monitor_mask" else (torch.float32 if name == "monitor_initial" else torch.long)
+            dtype = torch.bool if name == "monitor_mask" else (
+                torch.float32 if name in ("monitor_initial", "before_clean_opacity") else torch.long)
             self.register_buffer(name, torch.empty(0, device=device, dtype=dtype))
-        for name in ("monitor_step", "monitor_count", "deleted_total", "cursor", "last_alert"):
+        for name in ("monitor_step", "monitor_count", "deleted_total", "last_alert", "audit_round"):
             self.register_buffer(name, torch.zeros((), device=device, dtype=torch.long))
+        self.register_buffer("audit_step", torch.full((), -1, device=device, dtype=torch.long))
         self.register_buffer("monitor_raw_sum", torch.zeros((), device=device))
         self.last_evidence = {}
         self.gradient_stats = {}
 
     def initialize(self, num_points, num_frames):
         for name in self.point_fields:
-            shape = (num_points, (num_frames + 62) // 63) if name.endswith("_bits") and name != "camera_bits" else (num_points,)# 支持帧记录使用的整数个数
+            shape = (num_points, (num_frames + 62) // 63) if name.endswith("_bits") and name != "camera_bits" else (num_points,)
             self._buffers[name] = self._buffers[name].new_zeros(shape)
-        self.confirmed_at.fill_(-1)# 每个背景高斯首次被确认是残影、需要清理的训练步数，初始化为-1
+        self.confirmed_at.fill_(-1)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if prefix + "free_bits" in state_dict:
+            raise RuntimeError("Legacy residual-clean checkpoint uses free-space evidence. "
+                               "Evaluate it with its saved code; start the revised experiment from step 0.")
         for name in self.point_fields:
             self._buffers[name] = torch.empty_like(state_dict[prefix + name], device=self.monitor_step.device)
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
@@ -48,109 +61,272 @@ class BackgroundCleanup(nn.Module):
             repeats = (n,) + (1,) * (values.ndim - 1)
             self._buffers[name] = torch.cat((values, values[splits].repeat(repeats), values[duplicates]))
         self.monitor_mask[old_count:] = False
-    
+        self.confirmed_at[old_count:] = -1
+        self.confirmed_rounds[old_count:] = 0
+
     @torch.no_grad()
     def retain(self, deleted):
         if not self.instance.numel():
             return
-        self.deleted_total.add_(((self.confirmed_at >= 0) & deleted).sum())# 累计“曾被确认为残影、且本次被裁剪”的高斯数量
-        for name in self.point_fields:# 遍历清理模块的属性
-            self._buffers[name] = self._buffers[name][~deleted]# 删除属性中被裁剪的高斯对应行
+        self.deleted_total.add_(((self.confirmed_at >= 0) & deleted).sum())
+        for name in self.point_fields:
+            self._buffers[name] = self._buffers[name][~deleted]
 
     def ramp(self, step):
         return max(0., min(1., (step - self.cfg.start_step) / self.cfg.loss_ramp_steps))
-    # 判断背景高斯是否是节点残影
+
     def score(self):
-        return ((self.confirmed_at >= 0) & (self.static_count < self.cfg.static_veto_frames)).float()# 背景残影高斯掩码：曾经被确认是残影且当前静态支持帧数小于阈值的高斯为1，否则为0
-    # 门控强度
+        return (self.confirmed_at >= 0).float()
+
     def gate(self, step):
-        age = (step - self.confirmed_at).clamp_min(0)# 每个高斯首次确认是残影后经过了多少步，表示残影高斯的年龄
-        return self.score() * (age.float() / self.cfg.gate_ramp_steps).clamp(max=1.) * self.cfg.max_gate# 门控强度：随着残影高斯的年龄越来越大，门控强度越来越大，直到1
-    # 
+        age = (step - self.confirmed_at).clamp_min(0)
+        return self.score() * (age.float() / self.cfg.gate_ramp_steps).clamp(max=1.) * self.cfg.max_gate
+
     def apply_gate(self, opacity, step):
         if not self.instance.numel():
             return opacity
-        return opacity * (1. - self.gate(step)[:, None])# 用门控强度逐渐缩小残影高斯的不透明度，让其逐渐消失
-    # 背景残影高斯掩码
+        return opacity * (1. - self.gate(step)[:, None])
+
     def deletion_mask(self, step):
-        return (self.score() > 0) & (step - self.confirmed_at >= self.cfg.delete_after_steps)# 当前确认是残影且年龄大于阈值
+        return ((self.score() > 0) & (step - self.confirmed_at >= self.cfg.delete_after_steps)
+                & (self.confirmed_rounds >= self.cfg.min_confirmed_rounds))
+
+    def protected_mask(self, step):
+        return (self.score() > 0) & ~self.deletion_mask(step)
+
+    def should_audit(self, step, final=False):
+        return step >= self.cfg.start_step and (
+            not self.instance.numel() or int(self.audit_step) < self.cfg.start_step
+            or (step - self.cfg.start_step) % self.cfg.audit_interval == 0
+            or step in self.cfg.discovery_steps or final)
 
     @torch.no_grad()
     def _add_frame(self, ids, frame, kind):
-        bits = getattr(self, kind + "_bits")# 背景高斯的静态/自由/动态支持帧掩码（几个63位整数，分别记录某时间步是否支持，支持为1，不支持为0）
-        word, shift = divmod(frame, 63)# 当前时间步在第几个整数中，以及在该整数的第几位，编号都从0开始
+        bits = getattr(self, kind + "_bits")
+        word, shift = divmod(frame, 63)
         bit = 1 << shift
-        fresh = (bits[ids, word] & bit) == 0# 是否得到该时间步的第一次静态/自由/动态支持，true表示该时间步是第一次支持，false表示该时间步已经支持过
-        bits[ids, word] |= bit# 将背景高斯的静态/自由/动态支持帧掩码中该时间步的位设置为1，表示该时间步已经支持过
-        getattr(self, kind + "_count")[ids[fresh]] += 1# 背景高斯的静态/自由/动态支持帧数：只有在该时间步第一次支持时，才增加支持帧数
-    # 更新背景高斯的静态/自由/动态支持时间帧掩码和支持帧数、动态支持相机掩码和相机数，得到背景高斯首次被确认是残影的训练步数
-    @torch.no_grad()
-    def update(self, model, identity, labels, image_infos, cam_infos, frame, step):
-        if step < self.cfg.start_step or step % self.cfg.evidence_interval:# 从训练25000步开始更新，更新间隔是10
-            return
-        if not self.instance.numel():
-            self.initialize(model.num_points, identity.poses.shape[0])# 初始化背景残影高斯首次被确认的训练步数
-        count = min(model.num_points, self.cfg.max_points_per_update)# 确定本次扫描多少个高斯
-        ids = (torch.arange(count, device=model._means.device) + self.cursor) % model.num_points# 本次扫描高斯编号：从上次扫描结束的位置开始，生成本次扫描编号，如果超过总编号，则从0开始
-        self.cursor.copy_((self.cursor + count) % model.num_points)# 保存下一次扫描的起点
-        tracked = torch.where((self.instance > 0) & (self.static_count < self.cfg.static_veto_frames))[0]# 跟踪高斯编号：所有已关联车辆节点、且未被静态证据否决的高斯编号
-        ids = torch.cat((ids[self.instance[ids] == 0], tracked))# 合并本次扫描中未关联节点的高斯编号和已跟踪高斯编号
-        means = model._means.detach()[ids]
-        c2w = cam_infos["camera_to_world"]
-        xyz = (means - c2w[:3, 3]) @ c2w[:3, :3]
-        projected = xyz @ cam_infos["intrinsics"].T
-        uv = projected[:, :2] / xyz[:, 2:].clamp_min(1e-6)# 未关联节点和已跟踪高斯中心投影到当前图像
-        h, w = labels.shape
-        inside = (xyz[:, 2] > .1) & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
-        ids, xyz, uv, means = ids[inside], xyz[inside], uv[inside].long(), means[inside]# 在相机视野且在相机前方的未关联节点和已跟踪高斯编号、相机中心坐标、投影坐标和世界中心坐标
-        pixel_labels = labels[uv[:, 1], uv[:, 0]]# 未关联节点和已跟踪高斯的投影像素点的弱标签
-        depth = image_infos["cleanup_depth_map"]
+        fresh = (bits[ids, word] & bit) == 0
+        bits[ids, word] |= bit
+        getattr(self, kind + "_count")[ids[fresh]] += 1
+
+    def _observation(self, image_set, index, identity, device):
+        image, camera = image_set.get_image(index, camera_downscale=1.0)
+        frame = int(image["frame_idx"].flatten()[0])
+        image = {key: image[key].to(device) for key in (
+            "dynamic_masks", "sky_masks", "egocar_masks", "cleanup_depth_map") if key in image}
+        camera = {key: camera[key].to(device) for key in ("camera_to_world", "intrinsics", "cam_id")}
+        labels = identity.image_labels(image, camera, frame)
+        blocked = (labels != 0) | (image["dynamic_masks"] > .5)
+        margin = self.cfg.boundary_margin_pixels
+        safe = F.max_pool2d(blocked.float()[None, None], 2 * margin + 1, stride=1, padding=margin)[0, 0] == 0
+        integral = F.pad(blocked.long().cumsum(0).cumsum(1), (1, 0, 1, 0))
+        return frame, image, camera, labels, safe, integral
+
+    def _sample_depth(self, depth, labels, uv, safe):
+        """Keep valid measurements; fill only unknown pixels from coherent same-ID neighbors."""
+        x, y = uv.unbind(-1)
+        direct = depth[y, x]
+        valid = torch.isfinite(direct) & (direct > 0)
+        measured = torch.where(valid, direct, torch.full_like(direct, torch.inf))
+        source = valid.long()
+        missing = torch.where(~valid & (labels[y, x] >= 0))[0]
+        mx, my = x[missing], y[missing]
+        center_labels = labels[my, mx]
+        h, w = depth.shape
+        values, accepted = [], []
         radius = self.cfg.depth_neighborhood
-        filled = depth.masked_fill(depth <= 0, torch.inf)# 清理深度图<=0替换为正无穷
-        nearest = -F.max_pool2d(-filled[None, None], 2 * radius + 1, stride=1, padding=radius)[0, 0]# 最小池化的清理深度图：清理深度图通过“取负 → 最大池化 → 再取负”实现最小池化，每个像素取以它为中心的3×3区域内的最小深度
-        measured = nearest[uv[:, 1], uv[:, 0]]# 未关联节点和已跟踪高斯的目标深度（LiDAR 观测点的相机z深度）
-        observed = torch.isfinite(measured)# 已知的目标深度
-        delta = xyz[:, 2] - measured# 未关联节点和已跟踪高斯深度与目标深度之差
-        surface_margin = self.cfg.surface_margin + self.cfg.surface_relative_margin * xyz[:, 2]# 高斯深度与目标深度误差=固定容差+随深度增加的容差
-        surface = observed & (delta.abs() <= surface_margin)# 表面附近的高斯：未关联节点和已跟踪高斯深度接近目标深度且目标深度已知时
-        free = observed & (-delta > self.cfg.free_margin + self.cfg.free_relative_margin * xyz[:, 2])# 自由空间高斯/位于表面前方高斯：未关联节点和已跟踪高斯深度明显小于目标深度且目标深度已知时
-        # 静态支持和自由空间支持，更新静态/自由支持时间帧掩码和支持帧数
-        static_ids = ids[(pixel_labels == 0) & surface]# 静态支持高斯编号：投影区域是背景且位于背景表面附近。 
-        free_ids = ids[(pixel_labels == 0) & free]# 自由空间支持高斯编号：投影区域是背景且位于背景表面前方。 
-        # 如果该时间步是第一次支持，就把静态/自由支持时间帧掩码的该时间步的位设置为1，并加到静态/自由支持帧数
-        self._add_frame(static_ids, frame, "static")
-        self._add_frame(free_ids, frame, "free")
-        # 筛选可靠的动态支持
-        dynamic = (pixel_labels > 0) & surface# 动态支持：投影区域是节点且位于车辆表面附近
-        candidate_ids, candidate_labels = ids[dynamic], pixel_labels[dynamic]# 动态支持高斯编号和动态支持高斯弱标签
-        candidate_means = means[dynamic]# 动态支持高斯的世界中心坐标
-        self.last_evidence = {"surface_dynamic": candidate_ids.numel(), "reliable_dynamic": 0,
-                              "free_observations": free_ids.numel(), "static_observations": static_ids.numel()}
-        if candidate_ids.numel():
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                nx, ny = mx + dx, my + dy
+                inside = (nx >= 0) & (nx < w) & (ny >= 0) & (ny < h)
+                nx, ny = nx.clamp(0, w - 1), ny.clamp(0, h - 1)
+                value = depth[ny, nx]
+                same_id = labels[ny, nx] == center_labels
+                background_safe = (center_labels > 0) | (safe[my, mx] & safe[ny, nx])
+                accepted.append(inside & same_id & background_safe & torch.isfinite(value) & (value > 0))
+                values.append(value)
+        values, accepted = torch.stack(values, -1), torch.stack(accepted, -1)
+        count = accepted.sum(-1)
+        sorted_values = values.masked_fill(~accepted, torch.inf).sort(-1).values
+        low = sorted_values[:, 0]
+        high = values.masked_fill(~accepted, -torch.inf).max(-1).values
+        median = sorted_values.gather(1, ((count - 1).clamp_min(0) // 2)[:, None])[:, 0]
+        coherent = ((count >= self.cfg.min_depth_neighbors)
+                    & (high - low <= self.cfg.fill_depth_margin + self.cfg.fill_depth_relative_margin * median))
+        filled_ids = missing[coherent]
+        measured[filled_ids] = low[coherent]
+        source[filled_ids] = 2
+        return measured, source
+
+    def _static_footprint_safe(self, model, ids, xyz, uv, camera, integral):
+        """Project covariance with the original camera, avoiding dynamic/ignored regions."""
+        from models.gaussians.basics import quat_to_rotmat
+        rotation = quat_to_rotmat(model.get_quats[ids])
+        scaled = rotation * model.get_scaling[ids, None, :]
+        covariance = scaled @ scaled.transpose(-1, -2)
+        camera_rotation = camera["camera_to_world"][:3, :3]
+        covariance = camera_rotation.T @ covariance @ camera_rotation
+        k = camera["intrinsics"]
+        z = xyz[:, 2]
+        jacobian = xyz.new_zeros((ids.numel(), 2, 3))
+        jacobian[:, 0, 0] = k[0, 0] / z
+        jacobian[:, 1, 1] = k[1, 1] / z
+        jacobian[:, 0, 2] = -k[0, 0] * xyz[:, 0] / z.square()
+        jacobian[:, 1, 2] = -k[1, 1] * xyz[:, 1] / z.square()
+        projected = jacobian @ covariance @ jacobian.transpose(-1, -2)
+        radius = (self.cfg.footprint_sigma * projected.diagonal(dim1=-2, dim2=-1).clamp_min(0).sqrt()
+                  + self.cfg.boundary_margin_pixels).ceil().long()
+        h, w = integral.shape[0] - 1, integral.shape[1] - 1
+        low, high = uv - radius, uv + radius + 1
+        within_image = (low >= 0).all(-1) & (high[:, 0] <= w) & (high[:, 1] <= h)
+        x0, y0 = low[:, 0].clamp(0, w), low[:, 1].clamp(0, h)
+        x1, y1 = high[:, 0].clamp(0, w), high[:, 1].clamp(0, h)
+        blocked = integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0]
+        return within_image & (blocked == 0)
+
+    def _observe(self, model, identity, ids, frame, image, camera, labels, safe, integral, discover=False):
+        means = model._means.detach()[ids]
+        c2w = camera["camera_to_world"]
+        xyz = (means - c2w[:3, 3]) @ c2w[:3, :3]
+        projected = xyz @ camera["intrinsics"].T
+        uv = projected[:, :2] / xyz[:, 2:].clamp_min(1e-6)
+        h, w = labels.shape
+        inside = ((xyz[:, 2] > .1) & torch.isfinite(uv).all(-1) & (uv[:, 0] >= 0)
+                  & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h))
+        local_ids = torch.where(inside)[0]
+        selected = ids[local_ids]
+        xyz, uv, means = xyz[inside], uv[inside].long(), means[inside]
+        pixel_labels = labels[uv[:, 1], uv[:, 0]]
+        measured, source = self._sample_depth(image["cleanup_depth_map"], labels, uv, safe)
+        observed = torch.isfinite(measured) & (pixel_labels >= 0)
+        surface = observed & ((xyz[:, 2] - measured).abs()
+                              <= self.cfg.surface_margin + self.cfg.surface_relative_margin * xyz[:, 2])
+        dynamic = (pixel_labels > 0) & surface
+        candidates = torch.where(dynamic)[0]
+        if candidates.numel():
+            candidate_labels = pixel_labels[candidates]
             poses = identity.poses[frame, candidate_labels - 1]
-            local = torch.bmm((candidate_means - poses[:, :3, 3])[:, None], poses[:, :3, :3]).squeeze(1)# 将动态支持高斯的世界中心坐标转换为局部坐标
-            in_box = (local.abs() <= identity.sizes[candidate_labels - 1] / 2 + self.cfg.box_margin).all(-1)# 条件一：检查中心是否位于扩大 0.2m 的实例框内，约束高斯的三维位置
-            probabilities = identity.classifier(model._id_features[candidate_ids]).softmax(-1)
-            #agrees = probabilities.argmax(-1) == candidate_labels# 预测ID与像素投影弱标签是否一致
-            confident = probabilities.gather(1, candidate_labels[:, None])[:, 0] >= self.cfg.id_confidence# 条件二：预测id取像素标签的概率至少为0.6，约束预测id与像素标签一致
-            same_instance = (self.instance[candidate_ids] == 0) | (self.instance[candidate_ids] == candidate_labels)# 条件三：尚未关联节点，或此前关联的就是这个节点，约束高斯始终关联同一个节点
-            # reliable = in_box & agrees & confident & same_instance# 中心在实例框内、预测ID与像素投影弱标签一致、预测ID 的概率至少为 0.6、尚未关联实例，或此前关联的就是这个实例
-            reliable = in_box & confident & same_instance# 条件一、条件二、条件三
-            reliable_ids, reliable_labels = candidate_ids[reliable], candidate_labels[reliable]# 动态支持高斯经过三个条件筛选后得到残影候选高斯编号和像素标签
-            self.instance[reliable_ids] = reliable_labels# 残影候选高斯的关联节点
-            self._add_frame(reliable_ids, frame, "support")# 更新动态支持时间帧掩码和支持帧数
-            cam_id = int(cam_infos["cam_id"].flatten()[0])# 目标图像的相机视角
-            self.camera_bits[reliable_ids] |= 1 << cam_id# 更新动态支持相机掩码：一个二进制整数，每一位表示一个相机，1表示该高斯在该相机视野内被动态支持过，0表示没有
-            self.last_evidence = {"surface_dynamic": candidate_ids.numel(), "reliable_dynamic": reliable_ids.numel(),
-                                  "free_observations": free_ids.numel(), "static_observations": static_ids.numel()}
-        camera_count = torch.zeros_like(self.camera_bits)# 更新动态支持相机数
-        for cam in range(6):
-            camera_count += (self.camera_bits >> cam) & 1
-        confirmed = ((self.support_count >= self.cfg.min_support_frames)
-                     & (self.free_count >= self.cfg.min_free_frames)
+            local = torch.bmm((means[candidates] - poses[:, :3, 3])[:, None], poses[:, :3, :3]).squeeze(1)
+            in_box = (local.abs() <= identity.sizes[candidate_labels - 1] / 2 + self.cfg.box_margin).all(-1)
+            probabilities = identity.classifier(model._id_features[selected[candidates]]).softmax(-1)
+            confident = probabilities.gather(1, candidate_labels[:, None])[:, 0] >= self.cfg.id_confidence
+            associated = self.instance[selected[candidates]]
+            same_instance = (associated == 0) | (associated == candidate_labels)
+            reliable = in_box & confident & same_instance & identity.valid[frame, candidate_labels - 1]
+            dynamic[candidates] = reliable
+            if discover:
+                self.instance[selected[candidates[reliable]]] = candidate_labels[reliable]
+        if discover:
+            return
+        static = (pixel_labels == 0) & surface & safe[uv[:, 1], uv[:, 0]]
+        static_candidates = torch.where(static)[0]
+        if static_candidates.numel():
+            static[static_candidates] &= self._static_footprint_safe(
+                model, selected[static_candidates], xyz[static_candidates], uv[static_candidates], camera, integral)
+        unknown = ~observed | ((pixel_labels == 0) & surface & ~static)
+        result = []
+        for mask in (dynamic, static, observed, unknown):
+            full = torch.zeros(ids.numel(), dtype=torch.bool, device=ids.device)
+            full[local_ids] = mask
+            result.append(full)
+        for name, mask in (("depth_direct", source == 1), ("depth_filled", source == 2),
+                           ("depth_unknown", source == 0), ("depth_conflict", observed & ~surface)):
+            self.last_evidence[name] += int(mask.sum())
+        return result
+
+    @torch.no_grad()
+    def audit(self, model, identity, image_set, step, optimizer, discover=False, log_dir=None):
+        """Hold parameters fixed while discovering and auditing all training observations."""
+        step = int(step)
+        if not self.instance.numel():
+            self.initialize(model.num_points, identity.poses.shape[0])
+            discover = True
+        device, chunk = model._means.device, self.cfg.max_points_per_update
+        logger.info("Background cleanup audit at %d: discovery=%s, training images=%d", step, discover, len(image_set))
+        if discover:
+            unassociated = torch.where(self.instance == 0)[0]
+            for index in range(len(image_set)):
+                observation = self._observation(image_set, index, identity, device)
+                for start in range(0, unassociated.numel(), chunk):
+                    ids = unassociated[start:start + chunk]
+                    ids = ids[self.instance[ids] == 0]
+                    if ids.numel():
+                        self._observe(model, identity, ids, *observation, discover=True)
+                if (index + 1) % 50 == 0:
+                    logger.info("Background cleanup discovery: %d/%d images", index + 1, len(image_set))
+        tracked = torch.where(self.instance > 0)[0]
+        for kind in self.evidence_kinds:
+            getattr(self, kind + "_bits").zero_()
+            getattr(self, kind + "_count").zero_()
+        self.camera_bits.zero_()
+        self.last_evidence = dict(depth_direct=0, depth_filled=0, depth_unknown=0, depth_conflict=0)
+        frames = {}
+        for index, image_index in enumerate(image_set.split_indices):
+            frame = image_set.datasource.parse_img_idx(int(image_index))[1]
+            frames.setdefault(frame, []).append(index)
+        for frame in sorted(frames):
+            dynamic = torch.zeros(tracked.numel(), dtype=torch.bool, device=device)
+            static, observed, unknown = torch.zeros_like(dynamic), torch.zeros_like(dynamic), torch.zeros_like(dynamic)
+            cameras = torch.zeros(tracked.numel(), dtype=torch.long, device=device)
+            if tracked.numel():
+                for index in frames[frame]:
+                    observation = self._observation(image_set, index, identity, device)
+                    observed_frame, _, camera, _, _, _ = observation
+                    if observed_frame != frame:
+                        raise ValueError("Cleanup audit image/frame mapping mismatch")
+                    camera_bit = 1 << int(camera["cam_id"].flatten()[0])
+                    for start in range(0, tracked.numel(), chunk):
+                        part = slice(start, start + chunk)
+                        d, s, o, u = self._observe(model, identity, tracked[part], *observation)
+                        dynamic[part] |= d
+                        static[part] |= s
+                        observed[part] |= o
+                        unknown[part] |= u
+                        cameras[part] |= d.long() * camera_bit
+            conflict = dynamic & static
+            dynamic &= ~conflict
+            static &= ~conflict
+            self._add_frame(tracked, frame, "checked")
+            for kind, mask in (("support", dynamic), ("static", static), ("observed", observed),
+                               ("unknown", unknown & ~(dynamic | static)), ("conflict", conflict)):
+                self._add_frame(tracked[mask], frame, kind)
+            self.camera_bits[tracked] |= cameras * (~conflict).long()
+        camera_count = torch.zeros_like(self.camera_bits)
+        for camera in image_set.datasource.camera_list:
+            camera_count += (self.camera_bits >> int(camera)) & 1
+        confirmed = ((self.instance > 0) & (self.support_count >= self.cfg.min_support_frames)
                      & (camera_count >= self.cfg.min_cameras)
-                     & (self.static_count < self.cfg.static_veto_frames))# 已确认残影高斯：动态支持帧数、自由支持帧数和动态支持相机数至少达到阈值，且静态支持帧数小于静态否决帧数
-        self.confirmed_at[confirmed & (self.confirmed_at < 0)] = step# 背景高斯首次被确认是残影的训练步数：只有在该高斯首次被确认是残影时，才记录训练步数
+                     & (self.static_count < self.cfg.static_veto_frames)
+                     & (self.checked_count == len(frames)))
+        previous = self.confirmed_at >= 0
+        revoked, new = previous & ~confirmed, confirmed & ~previous
+        model._opacities[revoked, 0] = self.before_clean_opacity[revoked]
+        state = optimizer.state.get(model._opacities, {})
+        for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            if name in state:
+                state[name][revoked] = 0
+        self.before_clean_opacity[new] = model._opacities[new, 0]
+        self.confirmed_at[~confirmed] = -1
+        self.confirmed_at[new] = step
+        self.confirmed_rounds[confirmed] += 1
+        self.confirmed_rounds[~confirmed] = 0
+        self.audit_step.fill_(step)
+        self.audit_round.add_(1)
+        self.gradient_stats = {}
+        self.last_evidence.update(audit_step=step, audit_round=int(self.audit_round), audit_images=len(image_set),
+                                  audit_frames=len(frames), discovered_candidates=int(tracked.numel()),
+                                  confirmed_new=int(new.sum()), confirmed_revoked=int(revoked.sum()),
+                                  supported_frames_ready=int((self.support_count >= self.cfg.min_support_frames).sum()),
+                                  insufficient_dynamic_support=int((self.support_count[tracked] < self.cfg.min_support_frames).sum()),
+                                  fully_checked=int((self.checked_count[tracked] == len(frames)).sum()),
+                                  checked_frames_total=int(self.checked_count[tracked].sum()),
+                                  observed_frames_total=int(self.observed_count[tracked].sum()),
+                                  unknown_frames_total=int(self.unknown_count[tracked].sum()),
+                                  conflict_frames_total=int(self.conflict_count[tracked].sum()))
+        logger.info("Background cleanup audit complete: %s", json.dumps(self.last_evidence))
+        if log_dir is not None:
+            with open(os.path.join(log_dir, "cleanup_audits.jsonl"), "a") as stream:
+                stream.write(json.dumps(self.last_evidence) + "\n")
 
     def loss(self, model, step):
         if not self.instance.numel():
@@ -186,7 +362,6 @@ class BackgroundCleanup(nn.Module):
         if self.instance.numel():
             stats.update(tracked_with_id=int((self.instance > 0).sum()),
                          supported_frames_ready=int((self.support_count >= self.cfg.min_support_frames).sum()),
-                         free_frames_ready=int(((self.instance > 0) & (self.free_count >= self.cfg.min_free_frames)).sum()),
                          static_vetoed=int(((self.instance > 0) & (self.static_count >= self.cfg.static_veto_frames)).sum()))
         alerts = []
         if self.monitor_count > 0:

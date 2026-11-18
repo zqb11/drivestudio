@@ -308,8 +308,6 @@ class MultiTrainer(BasicTrainer):
             loss_dict.update(id_losses)
         background = self.models["Background"]
         if background.cleanup is not None and self.step >= background.cleanup.cfg.start_step:
-            background.cleanup.update(background, self.identity_field, outputs["id_labels"],
-                                      image_infos, cam_infos, int(self.cur_frame), self.step)# 更新背景高斯的静态/自由/动态支持时间帧掩码和支持帧数、动态支持相机掩码和相机数，得到背景高斯首次被确认是残影的训练步数
             loss_dict["background_clean_loss"] = background.cleanup.loss(background, self.step)
         
         return loss_dict
