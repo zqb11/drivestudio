@@ -4,9 +4,11 @@ import random
 import logging
 
 import torch
+import torch.nn.functional as F
 import numpy as np
+import torch.nn as nn
 from torch.nn import Parameter
-
+import open3d as o3d
 from models.human_body import phalp_colors, SMPLTemplate, get_on_mesh_init_geo_values, batch_rigid_transform, quaternion_to_matrix
 from models.gaussians.basics import *
 from models.nodes.rigid import RigidNodes
@@ -15,6 +17,7 @@ from pytorch3d.ops import knn_points
 
 RGB_tuples = torch.tensor(np.vstack([phalp_colors] * 10), dtype=torch.float32) / 255.0
 logger = logging.getLogger()
+
 # smpl节点高斯，继承普通高斯，初始化点个数、是否用体素deformer布尔值
 class SMPLNodes(RigidNodes):
     def __init__(
@@ -23,12 +26,24 @@ class SMPLNodes(RigidNodes):
     ):
         self.smpl_points_num = 6890# smpl实例中高斯点个数
         super().__init__(**kwargs)# 继承普通高斯模型
-        
+
+        self.gaussian_embedding_dim = self.ctrl_cfg.gaussian_embedding_dim
+        self.temporal_embedding_dim = self.ctrl_cfg.temporal_embedding_dim
+        self.no_gaussian_embedding_dim = self.ctrl_cfg.no_gaussian_embedding_dim
+        self.no_temporal_embedding_dim = self.ctrl_cfg.no_temporal_embedding_dim
+        self.no_coarse_deform = self.ctrl_cfg.no_coarse_deform
+        self.no_fine_deform = self.ctrl_cfg.no_fine_deform
+        self.no_c2f_temporal_embedding = self.ctrl_cfg.no_c2f_temporal_embedding
+        self.min_embeddings = self.ctrl_cfg.min_embeddings
+        self.max_embeddings = self.ctrl_cfg.max_embeddings
+        self.c2f_temporal_iter = self.ctrl_cfg.c2f_temporal_iter
+        self.no_apply_embed_shs = self.ctrl_cfg.no_apply_embed_shs
+        self.no_apply_embed_track = self.ctrl_cfg.no_apply_embed_track
+
         self.use_voxel_deformer=self.ctrl_cfg.use_voxel_deformer# 是否用体素deformer
         # overide here, because we use only one dimension for scale
         if self.ball_gaussians:
             self._scales = torch.zeros(1, 1, device=self.device)
-
         
     @property
     def num_instances(self):
@@ -36,6 +51,7 @@ class SMPLNodes(RigidNodes):
     @property
     def num_frames(self):
         return self.instances_fv.shape[0]
+    
     # 从smpl节点的动态实例字典初始化smpl实例高斯属性
     def create_from_pcd(self, instance_pts_dict: Dict[str, torch.Tensor]) -> None:
         """
@@ -65,9 +81,17 @@ class SMPLNodes(RigidNodes):
         smpl_betas, smpl_qauts = [], []
         instances_quats, instances_trans, instances_size = [], [], []
         instances_fv, point_ids = [], []
+
+        init_embeddings = []
+        self.prev_num_pts = []
+        self.neighbor_weight = []
+        self.neighbor_indices = []
+        self.weight = []
         # instances_pts, instances_colors = [], []
         for id_in_model, (id_in_dataset, v) in enumerate(instance_pts_dict.items()):# 遍历实例
             smpl_qauts.append(v["smpl_quats"][:, 1:, :].unsqueeze(1))# 实例关节局部朝向
+            init_embeddings.append(torch.zeros(self.smpl_points_num, self.gaussian_embedding_dim))
+            
             instances_quats.append(v["smpl_quats"][:, 0, :].unsqueeze(1))# 实例全局朝向
             instances_trans.append(v["smpl_trans"].unsqueeze(1))# 实例位置
             instances_fv.append(v["frame_info"].unsqueeze(1))# 实例在每个时间帧是否在任一视角可见且有匹配的smpl参数
@@ -76,8 +100,14 @@ class SMPLNodes(RigidNodes):
             # instances_pts.append(v["pts"])
             # instances_colors.append(v["colors"])
             point_ids.append(torch.full((self.smpl_points_num, 1), id_in_model, dtype=torch.long))# 高斯点的实例id
+            self.prev_num_pts.append(0)
+            self.neighbor_weight.append(None)
+            self.neighbor_indices.append(None)
+            self.weight.append(torch.normal(0., 0.01/np.sqrt(self.temporal_embedding_dim),size=(self.max_embeddings, self.temporal_embedding_dim)))
         # 在实例维度分别拼接局部朝向、全局朝向、位置、有效性、体型、长宽高、3D点所属实例id
         smpl_qauts = torch.cat(smpl_qauts, dim=1).to(self.device)                # (num_frame, num_instances, 23, 4)
+        init_embeddings = torch.cat(init_embeddings, dim=0).to(self.device) # (N, 4
+        self.weight = torch.stack(self.weight, dim=0).to(self.device) # (N, 4)
         instances_quats = torch.cat(instances_quats, dim=1).to(self.device)      # (num_frame, num_instances, 4)
         instances_trans = torch.cat(instances_trans, dim=1).to(self.device)      # (num_frame, num_instances, 3)
         instances_fv = torch.cat(instances_fv, dim=1).to(self.device)            # (num_frame, num_instances)
@@ -85,7 +115,15 @@ class SMPLNodes(RigidNodes):
         instances_size = torch.stack(instances_size).to(self.device)             # (num_instances, 3)
         point_ids = torch.cat(point_ids, dim=0).to(self.device)                  # (self.smpl_points_num*num_instances, 1)
         self.instances_fv    = instances_fv                            # (num_frame, num_instances)
-    
+        self._embeddings = Parameter(init_embeddings)
+        self.weight = Parameter(self.weight)
+        if not self.no_apply_embed_track:
+            self.track_smpl_c = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 24).cuda()
+            self.track_smpl_f = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 24).cuda()
+            self.track_smpl_c.weight.data.fill_(0)
+            self.track_smpl_c.bias.data.fill_(0)
+            self.track_smpl_f.weight.data.fill_(0)
+            self.track_smpl_f.bias.data.fill_(0)
         self.template = SMPLTemplate(
             smpl_model_path="smpl_models/SMPL_NEUTRAL.pkl",
             num_human=smpl_betas.shape[0],
@@ -168,6 +206,99 @@ class SMPLNodes(RigidNodes):
         self._features_dc   = Parameter(shs[:, 0, :],  requires_grad=not self.ctrl_cfg.freeze_shs_dc)# 从随机rgb初始化0阶SH系数
         self._features_rest = Parameter(shs[:, 1:, :], requires_grad=not self.ctrl_cfg.freeze_shs_rest)# 全0初始化高阶SH系数
 
+    def int_lininterp(self, t, init_val, final_val, until):
+        return int(init_val + (final_val - init_val) * min(max(t, 0), until) / until)
+
+    def get_temporal_embed(self, t, current_num_embeddings, align_corners=True, weight=None):
+
+        emb_resized = F.interpolate(weight[None,None,...], 
+                                 size=(current_num_embeddings, self.temporal_embedding_dim), 
+                                 mode='bilinear', align_corners=True)
+        N, _ = t.shape
+        t = t[0,0]
+
+        fdim = self.temporal_embedding_dim
+        grid = torch.cat([torch.arange(fdim).cuda().unsqueeze(-1)/(fdim-1), torch.ones(fdim,1).cuda() * t, ], dim=-1)[None,None,...]
+        grid = (grid - 0.5) * 2
+
+        emb = F.grid_sample(emb_resized, grid, align_corners=align_corners, mode='bilinear', padding_mode='reflection')
+        emb = emb.repeat(1,1,N,1).squeeze()
+        return emb
+
+    def query_time(self, time_emb, iter=None, feature_out=None, use_coarse_temporal_embedding=False, num_down_emb=30, mean=False, embeddings=None, weight=None):
+        feature_list = []
+
+        if not self.no_temporal_embedding_dim:
+            t = time_emb[:,:1]
+            if use_coarse_temporal_embedding:
+                h = self.get_temporal_embed(t, num_down_emb, weight=weight)
+            else:
+                if self.no_c2f_temporal_embedding:
+                    h = self.get_temporal_embed(t, self.max_embeddings, weight=weight)
+                else:
+                    if iter is None:
+                        iter = self.c2f_temporal_iter
+                    h = self.get_temporal_embed(t, self.int_lininterp(iter, num_down_emb, self.max_embeddings, self.c2f_temporal_iter), weight=weight)
+            if len(h.shape) == 1:
+                h = h.unsqueeze(0)
+            feature_list.append(h)
+        
+        if not self.no_gaussian_embedding_dim:
+            if mean:
+                embeddings = torch.mean(embeddings, dim=0, keepdim=True)
+
+            feature_list.append(embeddings)
+        
+        h = torch.cat(feature_list, dim=-1)
+        h = feature_out(h)   # [N,64]
+        return h
+    
+    def query_coarse_to_fine(self, time_emb, iter=None, feature_out_c=None, feature_out_f=None, mean=False, embeddings=None, weight=None):
+        h_c = None
+        if not self.no_coarse_deform:
+            h_c = self.query_time(time_emb, iter=iter, feature_out=feature_out_c, use_coarse_temporal_embedding=True, mean=mean, embeddings=embeddings, weight=weight)
+        h_f = None
+        if not self.no_fine_deform:
+            h_f = self.query_time(time_emb, iter=iter, feature_out=feature_out_f, use_coarse_temporal_embedding=False, mean=mean, embeddings=embeddings, weight=weight)
+        return h_c, h_f
+
+    def embedding_smlpl_rot_offset(self, frame=0, start_frame=0, end_frame=1, embeddings=None, weight=None):
+        normalized_frame = (frame - start_frame) / (end_frame - start_frame)
+        time_emb = torch.tensor([[normalized_frame]]).float().cuda()
+
+        def quaternion_raw_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            """
+            Multiply two quaternions.
+            Usual torch rules for broadcasting apply.
+
+            Args:
+                a: Quaternions as tensor of shape (..., 4), real part first.
+                b: Quaternions as tensor of shape (..., 4), real part first.
+
+            Returns:
+                The product of a and b, a tensor of quaternions shape (..., 4).
+            """
+            aw, ax, ay, az = torch.unbind(a, -1)
+            bw, bx, by, bz = torch.unbind(b, -1)
+            ow = aw * bw - ax * bx - ay * by - az * bz
+            ox = aw * bx + ax * bw + ay * bz - az * by
+            oy = aw * by - ax * bz + ay * bw + az * bx
+            oz = aw * bz + ax * by - ay * bx + az * bw
+            return torch.stack((ow, ox, oy, oz), -1)
+
+        track_rot_c, track_rot_f = self.query_coarse_to_fine(time_emb, iter=self.step, feature_out_c=self.track_rot_c, feature_out_f=self.track_rot_f, mean=True, embeddings=embeddings, weight=weight)
+        opt_rot_c = torch.zeros((4), device="cuda")
+        opt_rot_f = torch.zeros((4), device="cuda")
+
+        opt_rot_c[0] = torch.cos(track_rot_c)
+        opt_rot_c[3] = torch.sin(track_rot_c)
+        opt_rot_f[0] = torch.cos(track_rot_f)
+        opt_rot_f[3] = torch.sin(track_rot_f)
+
+        track_rot = quaternion_raw_multiply(opt_rot_c.unsqueeze(0), opt_rot_f.unsqueeze(0)).squeeze(0)
+
+        return track_rot
+
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = self.get_gaussian_param_groups()
         param_groups[self.class_prefix+"ins_rotation"] = [self.instances_quats]
@@ -176,6 +307,11 @@ class SMPLNodes(RigidNodes):
         if self.use_voxel_deformer:
             param_groups[self.class_prefix+"w_dc_vox"] = [self.template.voxel_deformer.voxel_w_correction]
         #     param_groups[self.class_prefix+"w_rest_vox"] = [self.template.voxel_deformer.additional_correction]
+        param_groups[self.class_prefix+"embeddings"] = [self._embeddings]
+        param_groups[self.class_prefix+"weight"] = [self.weight]
+        if not self.no_apply_embed_track:
+            param_groups[self.class_prefix+"track_smpl_c"] = self.track_smpl_c.parameters()
+            param_groups[self.class_prefix+"track_smpl_f"] = self.track_smpl_f.parameters()
         return param_groups
     
     @property
@@ -186,6 +322,7 @@ class SMPLNodes(RigidNodes):
         reshaped_x = x.reshape(self.num_instances, self.smpl_points_num, 3)
         _, nn_ind, _ = knn_points(reshaped_x, reshaped_x, K=self.ctrl_cfg.knn_neighbors, return_nn=False)
         self.nn_ind = nn_ind# 三维张量(num_instances, smpl_points_num, K)，每个点对应的K个最近邻索引 没有调用update_knn，进而没有定义nn_ind，导致后续调用nn_ind时报错
+    
     # 不做致密化
     def postprocess_per_train_step(
         self,
@@ -264,7 +401,44 @@ class SMPLNodes(RigidNodes):
         # transform the means to world space
         means_container += trans_per_pts
         return means_container
-    
+
+    def embedding_track_smpl_offset(self, frame=0, start_frame=0, end_frame=1, embeddings=None, weight=None):
+        normalized_frame = (frame - start_frame) / (end_frame - start_frame)
+        time_emb = torch.tensor([[normalized_frame]]).float().cuda()
+
+        def quaternion_raw_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            """
+            Multiply two quaternions.
+            Usual torch rules for broadcasting apply.
+
+            Args:
+                a: Quaternions as tensor of shape (..., 4), real part first.
+                b: Quaternions as tensor of shape (..., 4), real part first.
+
+            Returns:
+                The product of a and b, a tensor of quaternions shape (..., 4).
+            """
+            aw, ax, ay, az = torch.unbind(a, -1)
+            bw, bx, by, bz = torch.unbind(b, -1)
+            ow = aw * bw - ax * bx - ay * by - az * bz
+            ox = aw * bx + ax * bw + ay * bz - az * by
+            oy = aw * by - ax * bz + ay * bw + az * bx
+            oz = aw * bz + ax * by - ay * bx + az * bw
+            return torch.stack((ow, ox, oy, oz), -1)
+
+        track_rot_c, track_rot_f = self.query_coarse_to_fine(time_emb, iter=self.step, feature_out_c=self.track_smpl_c, feature_out_f=self.track_smpl_f, mean=True, embeddings=embeddings, weight=weight)
+        opt_rot_c = torch.zeros((24, 4), device="cuda")
+        opt_rot_f = torch.zeros((24, 4), device="cuda")
+
+        opt_rot_c[:, 0] = torch.cos(track_rot_c)
+        opt_rot_c[:, 3] = torch.sin(track_rot_c)
+        opt_rot_f[:, 0] = torch.cos(track_rot_f)
+        opt_rot_f[:, 3] = torch.sin(track_rot_f)
+
+        track_rot = quaternion_raw_multiply(opt_rot_c, opt_rot_f)
+
+        return track_rot
+
     def transform_means_and_quats(self, means: torch.Tensor, quats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         transform the means and quats of gaussians to world space
@@ -290,6 +464,26 @@ class SMPLNodes(RigidNodes):
                 (self.instances_quats[self.cur_frame], self.smpl_qauts[self.cur_frame]), dim=1
             )
             masked_theta = theta[instance_mask]
+        masked_theta = masked_theta.clone()
+
+        valid_idx = 0
+        for ins_id in range(self.num_instances):
+            if not instance_mask[ins_id]:
+                continue
+            rot_offset = self.embedding_track_smpl_offset(
+                frame=self.cur_frame,
+                start_frame=0,
+                end_frame=self.num_frames - 1,
+                embeddings=self._embeddings[(self.point_ids == ins_id).squeeze(1), :],
+                weight=self.weight[ins_id]
+            )
+            if rot_offset.isnan().any():
+                continue
+            # 将旋转修正应用到 global_quats_cur_frame
+            masked_theta_ = masked_theta[valid_idx].clone()
+            masked_theta[valid_idx] = quat_mult(masked_theta_, rot_offset)
+            valid_idx += 1
+
         masked_theta = self.quat_act(masked_theta)
         W, A = self.template(
             masked_theta = masked_theta, 
@@ -396,6 +590,7 @@ class SMPLNodes(RigidNodes):
             "_scales": activated_scales[filter_mask],
         }
         return gs_dict
+
     # SMPL节点高斯正则化：模板偏移、邻域一致性、运动平滑等正则
     def compute_reg_loss(self):
         loss_dict = super().compute_reg_loss()
@@ -518,6 +713,41 @@ class SMPLNodes(RigidNodes):
             
             loss_dict["x_offset"] = x_offset * x_offset_reg.w
 
+        def weighted_l2_loss_v2(x, y, w):
+            return torch.sqrt(((x - y) ** 2).sum(-1) * w + 1e-20).mean()
+
+        def o3d_knn(pts, num_knn):
+            indices = []
+            sq_dists = []
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(np.ascontiguousarray(pts, np.float64))
+            pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+            for p in pcd.points:
+                [_, i, d] = pcd_tree.search_knn_vector_3d(p, num_knn + 1)
+                indices.append(i[1:])
+                sq_dists.append(d[1:])
+            return np.array(sq_dists), np.array(indices)
+
+        embedding_reg = self.reg_cfg.get("embedding_reg", None)
+        try:
+            if embedding_reg is not None:
+                reg_loss = 0
+                for i in range(self.num_instances):
+                    if self.prev_num_pts[i] != self._means[(self.point_ids == i).squeeze(1)].shape[0] or self.neighbor_weight[i] is None or self.neighbor_indices[i] is None:
+                        neighbor_sq_dist, neighbor_indices = o3d_knn(self._means[(self.point_ids == i).squeeze(1)].detach().cpu().numpy(), 20)
+                        neighbor_weight = np.exp(-2000 * neighbor_sq_dist)
+                        neighbor_indices = torch.tensor(neighbor_indices).cuda().long().contiguous()
+                        self.neighbor_weight[i] = torch.tensor(neighbor_weight).cuda().float().contiguous()
+                        self.neighbor_indices[i] = neighbor_indices
+                        self.prev_num_pts[i] = self._means[(self.point_ids == i).squeeze(1)].shape[0]
+
+                    emb = self._embeddings[(self.point_ids == i).squeeze(1), :][:,None,:].repeat(1,20,1)
+                    emb_knn = self._embeddings[(self.point_ids == i).squeeze(1)][self.neighbor_indices[i]]
+                    reg_loss = 1.0 * weighted_l2_loss_v2(emb, emb_knn, self.neighbor_weight[i])
+                loss_dict["embedding_reg"] = reg_loss
+        except:
+            pass
+
         return loss_dict
     
     def state_dict(self) -> Dict:
@@ -526,6 +756,10 @@ class SMPLNodes(RigidNodes):
             "points_ids": self.point_ids,
             "instances_size": self.instances_size,
             "instances_fv": self.instances_fv,
+            "embeddings": self._embeddings,
+            "_weight": self.weight,
+            "track_smpl_c": self.track_smpl_c.state_dict(),
+            "track_smpl_f": self.track_smpl_f.state_dict(),
         })
         return state_dict
 
@@ -550,6 +784,12 @@ class SMPLNodes(RigidNodes):
             use_voxel_deformer=self.use_voxel_deformer,
             is_resume=True
         ).to(self.device)
+        self._embeddings = Parameter(state_dict.pop("embeddings"))
+        self.weight = state_dict.pop("_weight")
+        self.track_smpl_c = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 24).cuda()
+        self.track_smpl_f = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 24).cuda()
+        self.track_smpl_c.load_state_dict(state_dict.pop("track_smpl_c"))
+        self.track_smpl_f.load_state_dict(state_dict.pop("track_smpl_f"))
         if self.use_voxel_deformer:
             self.template.voxel_deformer.enable_voxel_correction()
         msg = VanillaGaussians.load_state_dict(self, state_dict, **kwargs)
@@ -570,6 +810,7 @@ class SMPLNodes(RigidNodes):
             "quats": activated_local_rotations,
             "sh_dcs": self._features_dc[pts_mask],
             "sh_rests": self._features_rest[pts_mask],
+            "embeddings": self._embeddings[pts_mask],
             "ids": self.point_ids[pts_mask],
         }
         return gaussian_dict
@@ -637,6 +878,7 @@ class SMPLNodes(RigidNodes):
                     "instances_fv": self.instances_fv[:, id],
                     "instances_quats": self.instances_quats.data[:, id],
                     "smpl_qauts": self.smpl_qauts.data[:, id],
+                    "embeddings": self._embeddings[self.point_ids[..., 0] == id],
                     "smpl_template": {
                         "J_canonical": self.template.J_canonical[id],
                         "W": self.template.W[id],
@@ -666,9 +908,11 @@ class SMPLNodes(RigidNodes):
             self._features_dc = Parameter(self._features_dc[mask])
             self._features_rest = Parameter(self._features_rest[mask])
             self._opacities = Parameter(self._opacities[mask])
+            self._embeddings = Parameter(self._embeddings[mask])
             self.point_ids = self.point_ids[mask]
             ins_mask = torch.ones(self.num_instances, device=self.device, dtype=torch.bool)
             ins_mask[ins_ids] = 0
+            self.weight = Parameter(self.weight[ins_mask])
             self.instances_fv = self.instances_fv[:, ins_mask]
             self.instances_quats = Parameter(self.instances_quats[:, ins_mask])
             self.smpl_qauts = Parameter(self.smpl_qauts[:, ins_mask])

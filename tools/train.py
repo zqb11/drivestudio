@@ -356,8 +356,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_root", default="./work_dirs/", help="path to save checkpoints and logs", type=str)
     
     # eval
-    parser.add_argument("--resume_from", default="work_dirs/omnire/deepaccident_mini_0_6cams_20260907/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
-    #parser.add_argument("--resume_from", default=None, help="path to checkpoint to resume from", type=str)
+    # parser.add_argument("--resume_from", default="work_dirs/omnire/deepaccident_mini_0_6cams_20260907/checkpoint_final.pth", help="path to checkpoint to resume from", type=str)
+    parser.add_argument("--resume_from", default=None, help="path to checkpoint to resume from", type=str)
     parser.add_argument("--render_video_postfix", type=str, default=None, help="an optional postfix for video")    
     
     # wandb logging part: 实验可视化与追踪工具

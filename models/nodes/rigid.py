@@ -3,8 +3,12 @@ import logging
 import random
 
 import torch
+import torch.nn.functional as F
+import torch.nn as nn
 from torch.nn import Parameter
 
+import open3d as o3d
+import numpy as np
 from models.modules import ConditionalDeformNetwork
 from models.gaussians.basics import *
 from models.gaussians.vanilla import VanillaGaussians
@@ -18,6 +22,18 @@ class RigidNodes(VanillaGaussians):
     ):
         super().__init__(**kwargs)
         
+        self.gaussian_embedding_dim = self.ctrl_cfg.gaussian_embedding_dim
+        self.temporal_embedding_dim = self.ctrl_cfg.temporal_embedding_dim
+        self.no_gaussian_embedding_dim = self.ctrl_cfg.no_gaussian_embedding_dim
+        self.no_temporal_embedding_dim = self.ctrl_cfg.no_temporal_embedding_dim
+        self.no_coarse_deform = self.ctrl_cfg.no_coarse_deform
+        self.no_fine_deform = self.ctrl_cfg.no_fine_deform
+        self.no_c2f_temporal_embedding = self.ctrl_cfg.no_c2f_temporal_embedding
+        self.min_embeddings = self.ctrl_cfg.min_embeddings
+        self.max_embeddings = self.ctrl_cfg.max_embeddings
+        self.c2f_temporal_iter = self.ctrl_cfg.c2f_temporal_iter
+        self.no_apply_embed_shs = self.ctrl_cfg.no_apply_embed_shs
+        self.no_apply_embed_track = self.ctrl_cfg.no_apply_embed_track
     @property
     def num_instances(self):
         return self.instances_fv.shape[1]
@@ -53,19 +69,31 @@ class RigidNodes(VanillaGaussians):
         # collect all instances
         init_means = []
         init_colors = []
+        init_embeddings = []
         instances_pose = []
         instances_size = []
         instances_fv = []
         point_ids = []
+        self.prev_num_pts = []
+        self.neighbor_weight = []
+        self.neighbor_indices = []
+        self.weight = []
         for id_in_model, (id_in_dataset, v) in enumerate(instance_pts_dict.items()):
             init_means.append(v["pts"])# 用局部坐标系下实例点云坐标初始化刚性节点高斯位置
             init_colors.append(v["colors"])
+            init_embeddings.append(torch.zeros(v["num_pts"], self.gaussian_embedding_dim))
             instances_pose.append(v["poses"].unsqueeze(1))
             instances_size.append(v["size"])
             instances_fv.append(v["frame_info"].unsqueeze(1))
             point_ids.append(torch.full((v["num_pts"], 1), id_in_model, dtype=torch.long))
+            self.prev_num_pts.append(0)
+            self.neighbor_weight.append(None)
+            self.neighbor_indices.append(None)
+            self.weight.append(torch.normal(0., 0.01/np.sqrt(self.temporal_embedding_dim),size=(self.max_embeddings, self.temporal_embedding_dim)))
         init_means = torch.cat(init_means, dim=0).to(self.device) # (N, 3)
         init_colors = torch.cat(init_colors, dim=0).to(self.device) # (N, 3)
+        init_embeddings = torch.cat(init_embeddings, dim=0).to(self.device) # (N, 4)
+        self.weight = torch.stack(self.weight, dim=0).to(self.device) # (N, 4)
         instances_pose = torch.cat(instances_pose, dim=1).to(self.device) # (num_frame, num_instances, 4, 4)
         self.instances_size = torch.stack(instances_size).to(self.device) # (num_instances, 3)
         self.instances_fv = torch.cat(instances_fv, dim=1).to(self.device) # (num_frame, num_instances)
@@ -75,6 +103,24 @@ class RigidNodes(VanillaGaussians):
         
         # initialize the means, scales, quats, and colors
         self._means = Parameter(init_means)# 从点云坐标初始化均值
+        self._embeddings = Parameter(init_embeddings)
+        self.weight = Parameter(self.weight)
+
+        if not self.no_apply_embed_track:
+            self.track_rot_c = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 1).cuda()
+            self.track_rot_f = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 1).cuda()
+            self.track_trans_c = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 3).cuda()
+            self.track_trans_f = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 3).cuda()
+            # init weights as 0
+            self.track_rot_c.weight.data.fill_(0)
+            self.track_rot_c.bias.data.fill_(0)
+            self.track_rot_f.weight.data.fill_(0)
+            self.track_rot_f.bias.data.fill_(0)
+
+            self.track_trans_f.weight.data.fill_(0)
+            self.track_trans_f.bias.data.fill_(0)
+            self.track_trans_c.weight.data.fill_(0)
+            self.track_trans_c.bias.data.fill_(0)
         distances, _ = k_nearest_sklearn(self._means.data, 3)
         distances = torch.from_numpy(distances)
         avg_dist = distances.mean(dim=-1, keepdim=True).to(self.device)# 计算每个高斯中心点到其最近的3个点的平均距离
@@ -99,10 +145,117 @@ class RigidNodes(VanillaGaussians):
         self._opacities = Parameter(torch.logit(0.1 * torch.ones(self.num_points, 1, device=self.device)))
         logger.info(f"[{self.class_prefix.rstrip('#')}] Successfully initialized {self.num_points} Gaussians with opacity init value 0.1")
 
+    def int_lininterp(self, t, init_val, final_val, until):
+        return int(init_val + (final_val - init_val) * min(max(t, 0), until) / until)
+
+    def get_temporal_embed(self, t, current_num_embeddings, align_corners=True, weight=None):
+
+        emb_resized = F.interpolate(weight[None,None,...], 
+                                 size=(current_num_embeddings, self.temporal_embedding_dim), 
+                                 mode='bilinear', align_corners=True)
+        N, _ = t.shape
+        t = t[0,0]
+
+        fdim = self.temporal_embedding_dim
+        grid = torch.cat([torch.arange(fdim).cuda().unsqueeze(-1)/(fdim-1), torch.ones(fdim,1).cuda() * t, ], dim=-1)[None,None,...]
+        grid = (grid - 0.5) * 2
+
+        emb = F.grid_sample(emb_resized, grid, align_corners=align_corners, mode='bilinear', padding_mode='reflection')
+        emb = emb.repeat(1,1,N,1).squeeze()
+        return emb
+
+    def query_time(self, time_emb, iter=None, feature_out=None, use_coarse_temporal_embedding=False, num_down_emb=30, mean=False, embeddings=None, weight=None):
+        feature_list = []
+
+        if not self.no_temporal_embedding_dim:
+            t = time_emb[:,:1]
+            if use_coarse_temporal_embedding:
+                h = self.get_temporal_embed(t, num_down_emb, weight=weight)
+            else:
+                if self.no_c2f_temporal_embedding:
+                    h = self.get_temporal_embed(t, self.max_embeddings, weight=weight)
+                else:
+                    if iter is None:
+                        iter = self.c2f_temporal_iter
+                    h = self.get_temporal_embed(t, self.int_lininterp(iter, num_down_emb, self.max_embeddings, self.c2f_temporal_iter), weight=weight)
+            if len(h.shape) == 1:
+                h = h.unsqueeze(0)
+            feature_list.append(h)
+        
+        if not self.no_gaussian_embedding_dim:
+            if mean:
+                embeddings = torch.mean(embeddings, dim=0, keepdim=True)
+
+            feature_list.append(embeddings)
+        
+        h = torch.cat(feature_list, dim=-1)
+        h = feature_out(h)   # [N,64]
+        return h
+    
+    def query_coarse_to_fine(self, time_emb, iter=None, feature_out_c=None, feature_out_f=None, mean=False, embeddings=None, weight=None):
+        h_c = None
+        if not self.no_coarse_deform:
+            h_c = self.query_time(time_emb, iter=iter, feature_out=feature_out_c, use_coarse_temporal_embedding=True, mean=mean, embeddings=embeddings, weight=weight)
+        h_f = None
+        if not self.no_fine_deform:
+            h_f = self.query_time(time_emb, iter=iter, feature_out=feature_out_f, use_coarse_temporal_embedding=False, mean=mean, embeddings=embeddings, weight=weight)
+        return h_c, h_f
+
+    def embedding_track_rot_offset(self, frame=0, start_frame=0, end_frame=1, embeddings=None, weight=None):
+        normalized_frame = (frame - start_frame) / (end_frame - start_frame)
+        time_emb = torch.tensor([[normalized_frame]]).float().cuda()
+
+        def quaternion_raw_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            """
+            Multiply two quaternions.
+            Usual torch rules for broadcasting apply.
+
+            Args:
+                a: Quaternions as tensor of shape (..., 4), real part first.
+                b: Quaternions as tensor of shape (..., 4), real part first.
+
+            Returns:
+                The product of a and b, a tensor of quaternions shape (..., 4).
+            """
+            aw, ax, ay, az = torch.unbind(a, -1)
+            bw, bx, by, bz = torch.unbind(b, -1)
+            ow = aw * bw - ax * bx - ay * by - az * bz
+            ox = aw * bx + ax * bw + ay * bz - az * by
+            oy = aw * by - ax * bz + ay * bw + az * bx
+            oz = aw * bz + ax * by - ay * bx + az * bw
+            return torch.stack((ow, ox, oy, oz), -1)
+
+        track_rot_c, track_rot_f = self.query_coarse_to_fine(time_emb, iter=self.step, feature_out_c=self.track_rot_c, feature_out_f=self.track_rot_f, mean=True, embeddings=embeddings, weight=weight)
+        opt_rot_c = torch.zeros((4), device="cuda")
+        opt_rot_f = torch.zeros((4), device="cuda")
+
+        opt_rot_c[0] = torch.cos(track_rot_c)
+        opt_rot_c[3] = torch.sin(track_rot_c)
+        opt_rot_f[0] = torch.cos(track_rot_f)
+        opt_rot_f[3] = torch.sin(track_rot_f)
+
+        track_rot = quaternion_raw_multiply(opt_rot_c.unsqueeze(0), opt_rot_f.unsqueeze(0)).squeeze(0)
+
+        return track_rot
+
+    def embedding_track_trans_offset(self, frame=0, start_frame=0, end_frame=1, embeddings=None, weight=None):
+        normalized_frame = (frame - start_frame) / (end_frame - start_frame)
+        time_emb = torch.tensor([[normalized_frame]]).float().cuda()
+        track_trans_c, track_trans_f = self.query_coarse_to_fine(time_emb, iter=self.step, feature_out_c=self.track_trans_c, feature_out_f=self.track_trans_f, mean=True, embeddings=embeddings, weight=weight)
+        track_trans = track_trans_c + track_trans_f
+        track_trans = track_trans.squeeze(0)
+        return track_trans
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = self.get_gaussian_param_groups()
         param_groups[self.class_prefix+"ins_rotation"] = [self.instances_quats]
         param_groups[self.class_prefix+"ins_translation"] = [self.instances_trans]
+        param_groups[self.class_prefix+"embeddings"] = [self._embeddings]
+        param_groups[self.class_prefix+"weight"] = [self.weight]
+        if not self.no_apply_embed_track:
+            param_groups[self.class_prefix+"track_rot_c"] = self.track_rot_c.parameters()
+            param_groups[self.class_prefix+"track_rot_f"] = self.track_rot_f.parameters()
+            param_groups[self.class_prefix+"track_trans_c"] = self.track_trans_c.parameters()
+            param_groups[self.class_prefix+"track_trans_f"] = self.track_trans_f.parameters()
         return param_groups
     
     def get_instances_quats(self, instances_pose: torch.Tensor) -> torch.Tensor:
@@ -157,6 +310,7 @@ class RigidNodes(VanillaGaussians):
                     split_scales,
                     split_quats,
                     split_ids,
+                    split_embeddings,
                 ) = self.split_gaussians(splits, nsamps)
 
                 dups = (
@@ -172,6 +326,7 @@ class RigidNodes(VanillaGaussians):
                     dup_scales,
                     dup_quats,
                     dup_ids,
+                    dup_embeddings,
                 ) = self.dup_gaussians(dups)
                 
                 self._means = Parameter(torch.cat([self._means.detach(), split_means, dup_means], dim=0))
@@ -184,6 +339,7 @@ class RigidNodes(VanillaGaussians):
                 self.point_ids = torch.cat([self.point_ids, split_ids, dup_ids], dim=0)
                 
                 # append zeros to the max_2Dsize tensor
+                self._embeddings = Parameter(torch.cat([self._embeddings.detach(), split_embeddings, dup_embeddings], dim=0))
                 self.max_2Dsize = torch.cat(
                     [self.max_2Dsize, torch.zeros_like(split_scales[:, 0]), torch.zeros_like(dup_scales[:, 0])],
                     dim=0,
@@ -191,10 +347,12 @@ class RigidNodes(VanillaGaussians):
                 
                 split_idcs = torch.where(splits)[0]
                 param_groups = self.get_gaussian_param_groups()
+                param_groups[self.class_prefix+"embeddings"] = [self._embeddings]
                 dup_in_optim(optimizer, split_idcs, param_groups, n=nsamps)
 
                 dup_idcs = torch.where(dups)[0]
                 param_groups = self.get_gaussian_param_groups()
+                param_groups[self.class_prefix+"embeddings"] = [self._embeddings]
                 dup_in_optim(optimizer, dup_idcs, param_groups, 1)
 
             # cull NOTE: Offset all the opacity reset logic by refine_every so that we don't
@@ -202,6 +360,7 @@ class RigidNodes(VanillaGaussians):
             if self.step % reset_interval > max(self.num_train_images, self.ctrl_cfg.refine_interval):
                 deleted_mask = self.cull_gaussians()
                 param_groups = self.get_gaussian_param_groups()
+                param_groups[self.class_prefix+"embeddings"] = [self._embeddings]
                 remove_from_optim(optimizer, deleted_mask, param_groups)
             print(f"Class {self.class_prefix} left points: {self.num_points}")
 
@@ -250,6 +409,7 @@ class RigidNodes(VanillaGaussians):
         self._features_dc = Parameter(self._features_dc[~culls].detach())
         self._features_rest = Parameter(self._features_rest[~culls].detach())
         self._opacities = Parameter(self._opacities[~culls].detach())
+        self._embeddings = Parameter(self._embeddings[~culls].detach())
         self.point_ids = self.point_ids[~culls]
 
         print(f"     Cull: {n_bef - self.num_points}")
@@ -284,7 +444,8 @@ class RigidNodes(VanillaGaussians):
         new_quats = self._quats[split_mask].repeat(samps, 1)
         # step 6, sample new ids
         new_ids = self.point_ids[split_mask].repeat(samps, 1)
-        return new_means, new_feature_dc, new_feature_rest, new_opacities, new_scales, new_quats, new_ids
+        new_embeddings = self._embeddings[split_mask].repeat(samps, 1)
+        return new_means, new_feature_dc, new_feature_rest, new_opacities, new_scales, new_quats, new_ids, new_embeddings
 
     def dup_gaussians(self, dup_mask: torch.Tensor) -> Tuple:
         """
@@ -300,7 +461,8 @@ class RigidNodes(VanillaGaussians):
         dup_scales = self._scales[dup_mask]
         dup_quats = self._quats[dup_mask]
         dup_ids = self.point_ids[dup_mask]
-        return dup_means, dup_feature_dc, dup_feature_rest, dup_opacities, dup_scales, dup_quats, dup_ids
+        dup_embeddings = self._embeddings[dup_mask]
+        return dup_means, dup_feature_dc, dup_feature_rest, dup_opacities, dup_scales, dup_quats, dup_ids, dup_embeddings
     # 判断高斯中心是否在车辆框内
     def get_out_of_bound_mask(self):
         """
@@ -354,6 +516,18 @@ class RigidNodes(VanillaGaussians):
             )
         else:
             trans_cur_frame = self.instances_trans[self.cur_frame] # (num_instances, 3)
+        trans_cur_frame = trans_cur_frame.clone()
+        for ins_id in range(self.num_instances):
+            track_trans_offset = self.embedding_track_trans_offset(
+                frame=self.cur_frame,
+                start_frame=0,
+                end_frame=self.num_frames - 1,
+                embeddings=self._embeddings[(self.point_ids == ins_id).squeeze(1), :],
+                weight=self.weight[ins_id]
+            )
+            if track_trans_offset.isnan().any():
+                continue
+            trans_cur_frame[ins_id] = trans_cur_frame[ins_id] + track_trans_offset
         trans_per_pts = trans_cur_frame[self.point_ids[..., 0]]
         
         # transform the means to world space
@@ -370,6 +544,21 @@ class RigidNodes(VanillaGaussians):
         assert quats.shape[0] == self.point_ids.shape[0], \
             "its a bug here, we need to pass the mask for points_ids"
         global_quats_cur_frame = self.instances_quats[self.cur_frame]
+        global_quats_cur_frame = global_quats_cur_frame.clone()
+        # 针对每个实例单独应用 embedding_track_rot_offset 方法
+        for ins_id in range(self.num_instances):
+            rot_offset = self.embedding_track_rot_offset(
+                frame=self.cur_frame,
+                start_frame=0,
+                end_frame=self.num_frames - 1,
+                embeddings=self._embeddings[(self.point_ids == ins_id).squeeze(1), :],
+                weight=self.weight[ins_id]
+            )
+            # 将旋转修正应用到 global_quats_cur_frame
+            if rot_offset.isnan().any():
+                continue
+            global_quats_cur_frame_ = global_quats_cur_frame[ins_id].clone()
+            global_quats_cur_frame[ins_id] = quat_mult(global_quats_cur_frame_, rot_offset)
         global_quats_per_pts = global_quats_cur_frame[self.point_ids[..., 0]]
             
         global_quats_per_pts = self.quat_act(global_quats_per_pts)
@@ -477,6 +666,40 @@ class RigidNodes(VanillaGaussians):
                             next_trans = self.instances_trans[self.cur_frame + fi_interval].data
                             loss = (next_trans[valid_mask] + pre_trans[valid_mask] - 2 * cur_trans[valid_mask]).abs().mean()
                             loss_dict["trans_temporal_smooth"] = loss * trans_cfg.w
+        def weighted_l2_loss_v2(x, y, w):
+            return torch.sqrt(((x - y) ** 2).sum(-1) * w + 1e-20).mean()
+
+        def o3d_knn(pts, num_knn):
+            indices = []
+            sq_dists = []
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(np.ascontiguousarray(pts, np.float64))
+            pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+            for p in pcd.points:
+                [_, i, d] = pcd_tree.search_knn_vector_3d(p, num_knn + 1)
+                indices.append(i[1:])
+                sq_dists.append(d[1:])
+            return np.array(sq_dists), np.array(indices)
+
+        embedding_reg = self.reg_cfg.get("embedding_reg", None)
+        try:
+            if embedding_reg is not None:
+                reg_loss = 0
+                for i in range(self.num_instances):
+                    if self.prev_num_pts[i] != self._means[(self.point_ids == i).squeeze(1)].shape[0] or self.neighbor_weight[i] is None or self.neighbor_indices[i] is None:
+                        neighbor_sq_dist, neighbor_indices = o3d_knn(self._means[(self.point_ids == i).squeeze(1)].detach().cpu().numpy(), 20)
+                        neighbor_weight = np.exp(-2000 * neighbor_sq_dist)
+                        neighbor_indices = torch.tensor(neighbor_indices).cuda().long().contiguous()
+                        self.neighbor_weight[i] = torch.tensor(neighbor_weight).cuda().float().contiguous()
+                        self.neighbor_indices[i] = neighbor_indices
+                        self.prev_num_pts[i] = self._means[(self.point_ids == i).squeeze(1)].shape[0]
+
+                    emb = self._embeddings[(self.point_ids == i).squeeze(1), :][:,None,:].repeat(1,20,1)
+                    emb_knn = self._embeddings[(self.point_ids == i).squeeze(1)][self.neighbor_indices[i]]
+                    reg_loss = 1.0 * weighted_l2_loss_v2(emb, emb_knn, self.neighbor_weight[i])
+                loss_dict["embedding_reg"] = reg_loss
+        except:
+            pass
         return loss_dict
 
     def state_dict(self) -> Dict:
@@ -485,6 +708,12 @@ class RigidNodes(VanillaGaussians):
             "points_ids": self.point_ids,
             "instances_size": self.instances_size,
             "instances_fv": self.instances_fv,
+            "embeddings": self._embeddings,
+            "_weight": self.weight,
+            "track_rot_c": self.track_rot_c.state_dict(),
+            "track_rot_f": self.track_rot_f.state_dict(),
+            "track_trans_c": self.track_trans_c.state_dict(),
+            "track_trans_f": self.track_trans_f.state_dict(),
         })
         return state_dict
     
@@ -492,12 +721,22 @@ class RigidNodes(VanillaGaussians):
         self.point_ids = state_dict.pop("points_ids")
         self.instances_size = state_dict.pop("instances_size")
         self.instances_fv = state_dict.pop("instances_fv")
+        self._embeddings = Parameter(state_dict.pop("embeddings"))
+        self.weight = Parameter(state_dict.pop("_weight"))
         self.instances_trans = Parameter(
             torch.zeros(self.num_frames, self.num_instances, 3, device=self.device)
         )
         self.instances_quats = Parameter(
             torch.zeros(self.num_frames, self.num_instances, 4, device=self.device)
         )
+        self.track_rot_c = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 1).cuda()
+        self.track_rot_f = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 1).cuda()
+        self.track_trans_c = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 3).cuda()
+        self.track_trans_f = nn.Linear(self.gaussian_embedding_dim + self.temporal_embedding_dim, 3).cuda()
+        self.track_rot_c.load_state_dict(state_dict.pop("track_rot_c"))
+        self.track_rot_f.load_state_dict(state_dict.pop("track_rot_f"))
+        self.track_trans_c.load_state_dict(state_dict.pop("track_trans_c"))
+        self.track_trans_f.load_state_dict(state_dict.pop("track_trans_f"))
         msg = super().load_state_dict(state_dict, **kwargs)
         return msg
     
@@ -517,6 +756,7 @@ class RigidNodes(VanillaGaussians):
             self._features_dc = Parameter(self._features_dc[mask])
             self._features_rest = Parameter(self._features_rest[mask])
             self._opacities = Parameter(self._opacities[mask])
+            self._embeddings = Parameter(self._embeddings[mask])
             self.point_ids = self.point_ids[mask]
         
     def collect_gaussians_from_ids(self, ids: List[int]) -> Dict:
@@ -531,6 +771,7 @@ class RigidNodes(VanillaGaussians):
                     "_features_rest": self._features_rest[self.point_ids[..., 0] == id],
                     "_opacities": self._opacities[self.point_ids[..., 0] == id],
                     "point_ids": self.point_ids[self.point_ids[..., 0] == id],
+                    "embeddings": self._embeddings[self.point_ids[..., 0] == id],
                 }
                 gaussian_dict[id] = instance_raw_dict
         return gaussian_dict
@@ -556,6 +797,7 @@ class RigidNodes(VanillaGaussians):
             self._features_rest = Parameter(torch.cat([self._features_rest, new_gaussian["_features_rest"]], dim=0))
             self._opacities = Parameter(torch.cat([self._opacities, new_gaussian["_opacities"]], dim=0))
             # keeps original point ids
+            self._embeddings = Parameter(torch.cat([self._embeddings, new_gaussian["embeddings"]], dim=0))
             self.point_ids = torch.cat([self.point_ids, torch.full_like(new_gaussian["point_ids"], ins_id)], dim=0)
     
     def export_gaussians_to_ply(self, alpha_thresh: float, instance_id: List[int] = None) -> Dict[str, torch.Tensor]:
