@@ -5,7 +5,7 @@ dataset: deepaccident/6cams
 trainer:
   type: models.trainers.MultiTrainer
   optim:
-    num_iters: 30000
+    num_iters: 40000
     use_grad_scaler: false
     cache_buffer_freq: 2000 # we use error based image sampler for training with more than 3 cameras
   render:
